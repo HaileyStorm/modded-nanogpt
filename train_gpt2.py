@@ -56,86 +56,91 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
 class Muon(torch.optim.Optimizer):
     """
-    Muon - MomentUm Orthogonalized by Newton-schulz
+    Muon - MomentUm Orthogonalized by Newton-Schulz
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
+    Internally runs SGD with momentum, then replaces each 2D parameter's update
+    with the nearest orthogonal matrix (via Newton-Schulz iteration).
 
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
+    Warnings:
+    - Assumes all parameters are 2D.
+    - Not suitable for embeddings, final FC layers, or {0,1}-D parameters.
+    - 4D convolution filters should be flattened on their last 3 dimensions.
     """
+
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
         self.world_size = int(os.environ['WORLD_SIZE'])
         self.rank = int(os.environ['RANK'])
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+
         params = list(params)
         assert all(isinstance(p, torch.Tensor) for p in params)
+        # Group parameters by their size for collective updates
         sizes = {p.numel() for p in params}
-        param_groups = [
-            {
-                'params': [p for p in params if p.numel() == size],
-                'update_buffer': [
-                    torch.empty(size, device='cuda', dtype=torch.bfloat16)
-                    for _ in range(self.world_size)
-                ],
-            }
-            for size in sizes
-        ]
+        param_groups = []
+        for size in sizes:
+            same_size_params = [p for p in params if p.numel() == size]
+            update_buffer = [
+                torch.empty(size, device='cuda', dtype=torch.bfloat16)
+                for _ in range(self.world_size)
+            ]
+            param_groups.append({'params': same_size_params, 'update_buffer': update_buffer})
+
         super().__init__(param_groups, defaults)
 
+    @torch.no_grad()
     def step(self):
-
         for group in self.param_groups:
-
             lr = group['lr']
             momentum = group['momentum']
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
             update_buffers = group['update_buffer']
-            # generate weight updates in distributed fashion
             params = group['params']
+
+            # Ensure this divides evenly
             assert len(params) % self.world_size == 0
+
             handle = None
             params_world = None
+
             def update_prev():
                 if params_world is None:
                     return
                 assert handle is not None
                 handle.wait()
+                alpha = -lr
+                # Scale step size by sqrt(max(1, p_world.size(0)/p_world.size(1)))
+                # Done once per group of parameters to maintain logic
                 for p_world, g_world in zip(params_world, update_buffers):
-                    p_world.data.add_(
-                        g_world.view_as(p_world),
-                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
-                    )
-            for base_i in range(len(params))[::self.world_size]:
+                    scale = max(1, p_world.size(0) / p_world.size(1)) ** 0.5
+                    p_world.add_(g_world.view_as(p_world), alpha=alpha * scale)
+
+            # Loop over parameters in groups of world_size
+            block_size = self.world_size
+            for base_i in range(0, len(params), block_size):
                 p = params[base_i + self.rank]
                 g = p.grad
                 assert g is not None
+
                 state = self.state[p]
-                if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
-                buf = state['momentum_buffer']
+                buf = state.setdefault('momentum_buffer', torch.zeros_like(g))
+                # Momentum update
                 buf.lerp_(g, 1 - momentum)
-                g = g.lerp_(buf, momentum) if nesterov else buf
+                if nesterov:
+                    g = g.lerp(buf, momentum)
+                else:
+                    g = buf
+
                 g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+
+                # Finish previous block's update before starting next
                 update_prev()
                 handle = dist.all_gather(update_buffers, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
+                params_world = params[base_i: base_i + block_size]
+
+            # Update after the last block
             update_prev()
+
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -396,7 +401,6 @@ class Hyperparameters:
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
-    clip_val : float = 0.8
     # evaluation and logging hyperparams
     val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 #1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
@@ -581,8 +585,6 @@ for step in range(args.num_iterations + 1):
     frac = min(step/300, 1)
     for group in optimizer3.param_groups:
         group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-    # Apply gradient clipping
-    torch.nn.utils.clip_grad_norm_(scalar_params, args.clip_val)
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
