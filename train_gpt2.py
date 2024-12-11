@@ -23,8 +23,6 @@ import math
 ###########################################################################
 # OPTIMIZATION TESTS
 ###########################################################################
-# AutoClip settings
-use_autoclip = True
 
 
 # -----------------------------------------------------------------------------
@@ -399,8 +397,6 @@ class Hyperparameters:
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     initial_clip_val : float = 0.65
-    autoclip_window_size = 100
-    autoclip_percentile = 11.25
     # evaluation and logging hyperparams
     val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 #1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
@@ -504,20 +500,6 @@ def get_lr(it):
 
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-if use_autoclip:
-    grad_norm_window = deque(maxlen=args.autoclip_window_size)
-
-def autoclip(parameters):
-    if not use_autoclip:
-        return None, None
-    if len(grad_norm_window) < args.autoclip_window_size:
-        clip_value = args.initial_clip_val
-    else:
-        clip_value = np.percentile(list(grad_norm_window), args.autoclip_percentile)
-    total_norm = torch.nn.utils.clip_grad_norm_(parameters, clip_value)
-    grad_norm_window.append(total_norm.item())
-    return total_norm.item(), clip_value
-
 sliding_window_size = torch.tensor(64, dtype=torch.int32, device="cuda")
 sw_size_prev = 64
 # Start training loop
@@ -599,8 +581,8 @@ for step in range(args.num_iterations + 1):
     frac = min(step/300, 1)
     for group in optimizer3.param_groups:
         group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-    # Apply AutoClip to scalar_params, if enabled
-    current_grad_norm, current_clip_val = autoclip(scalar_params)
+    # Apply gradient clipping
+    torch.nn.utils.clip_grad_norm_(scalar_params, args.initial_clip_val)
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -611,8 +593,6 @@ for step in range(args.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     step_info = f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms"
-    if use_autoclip:
-        step_info += f" grad_norm:{current_grad_norm:.4f}, clip_val:{current_clip_val:.4f}"
     print0(step_info)
 
 print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
