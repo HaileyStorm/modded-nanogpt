@@ -182,25 +182,27 @@ class Rotary(torch.nn.Module):
 
 
 class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000, max_seq_len=1792):
+    def __init__(self, dim, base=10000):
         super().__init__()
         self.dim = dim
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
-
-        # Pre-compute cos and sin for a maximum sequence length
-        t = torch.arange(max_seq_len, device=self.inv_freq.device).type_as(self.inv_freq)
-        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-
-        self.register_buffer('cos_cached', emb.cos())  # [max_seq_len, dim]
-        self.register_buffer('sin_cached', emb.sin())  # [max_seq_len, dim]
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
 
     def forward(self, q, k):
         seq_len = q.shape[1]
-        cos = self.cos_cached[:seq_len].unsqueeze(0)  # [1, seq_len, dim]
-        sin = self.sin_cached[:seq_len].unsqueeze(0)  # [1, seq_len, dim]
-        return liger_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), cos, sin)
+        if seq_len != self.seq_len_cached:
+            t = torch.arange(seq_len, device=q.device).type_as(self.inv_freq)
+            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self.cos_cached = emb.cos()[None, :, None, :]  # [1, seq_len, 1, dim]
+            self.sin_cached = emb.sin()[None, :, None, :]  # [1, seq_len, 1, dim]
+            self.seq_len_cached = seq_len
+
+        return (q * self.cos_cached + torch.roll(q, shifts=1, dims=-1) * self.sin_cached,
+                k * self.cos_cached + torch.roll(k, shifts=1, dims=-1) * self.sin_cached)
 
 
 class CausalSelfAttention(nn.Module):
@@ -229,7 +231,7 @@ class CausalSelfAttention(nn.Module):
         #q, k = self.rotary(q), self.rotary(k)
         #y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         q, k = self.rotary(q, k)
-        y = flex_attention(q, k, v.transpose(1, 2), block_mask=block_mask)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
 
         y = y.transpose(1, 2).contiguous().view_as(x)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -428,8 +430,8 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 32  # 1 # batch size, in sequences, across all devices  # TODO: Return to original
-    sequence_length : int = 16*1024 # sequence length, in tokens  # TODO: Return to original
+    batch_size : int = 8  # 1 # batch size, in sequences, across all devices  # TODO: Return to original
+    sequence_length : int = 64*1024 # sequence length, in tokens  # TODO: Return to original
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
