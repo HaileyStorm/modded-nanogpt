@@ -306,7 +306,7 @@ class GPT(nn.Module):
         self.value_embeds = nn.Embedding(config.vocab_size, config.model_dim*self.num_encoder_layers)
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
-        self.loss_fn = torch.nn.CrossEntropyLoss() #LigerCrossEntropyLoss()
+        self.loss_fn = LigerCrossEntropyLoss()  # torch.nn.CrossEntropyLoss()
 
     def forward(self, inputs, targets, sliding_window_size):
 
