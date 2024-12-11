@@ -154,7 +154,7 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype))
 
 
-
+"""
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -178,9 +178,10 @@ class Rotary(torch.nn.Module):
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x)
-
-
 """
+
+
+
 class Rotary(torch.nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
@@ -201,7 +202,7 @@ class Rotary(torch.nn.Module):
             self.sin_cached = emb.sin().unsqueeze(0)  # [1, seq_len, dim]
             self.seq_len_cached = seq_len
         return liger_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), self.cos_cached, self.sin_cached)
-"""
+
 
 
 class CausalSelfAttention(nn.Module):
@@ -306,7 +307,7 @@ class GPT(nn.Module):
         self.value_embeds = nn.Embedding(config.vocab_size, config.model_dim*self.num_encoder_layers)
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
-        self.loss_fn = LigerCrossEntropyLoss()  # torch.nn.CrossEntropyLoss()
+        self.loss_fn = torch.nn.CrossEntropyLoss() #LigerCrossEntropyLoss()
 
     def forward(self, inputs, targets, sliding_window_size):
 
