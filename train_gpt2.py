@@ -400,7 +400,7 @@ class Hyperparameters:
     weight_decay : float = 0
     initial_clip_val : float = 0.65
     autoclip_window_size = 100
-    autoclip_percentile = 12.5
+    autoclip_percentile = 11.25
     # evaluation and logging hyperparams
     val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 #1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
