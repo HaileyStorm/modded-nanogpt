@@ -16,7 +16,6 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-from liger_kernel.transformers import LigerRMSNorm, liger_rotary_pos_emb, LigerSwiGLUMLP, LigerCrossEntropyLoss
 import numpy as np
 from collections import deque
 import math
@@ -25,7 +24,7 @@ import math
 # OPTIMIZATION TESTS
 ###########################################################################
 # AutoClip settings
-use_autoclip = False
+use_autoclip = True
 
 
 # -----------------------------------------------------------------------------
@@ -58,6 +57,29 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
 
 class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
         self.world_size = int(os.environ['WORLD_SIZE'])
         self.rank = int(os.environ['RANK'])
@@ -65,43 +87,32 @@ class Muon(torch.optim.Optimizer):
         params = list(params)
         assert all(isinstance(p, torch.Tensor) for p in params)
         sizes = {p.numel() for p in params}
-
-        param_groups = []
-        for size in sizes:
-            group_params = [p for p in params if p.numel() == size]
-            params_per_rank = (len(group_params) + self.world_size - 1) // self.world_size
-
-            for rank in range(self.world_size):
-                start_idx = rank * params_per_rank
-                end_idx = min((rank + 1) * params_per_rank, len(group_params))
-                if start_idx >= len(group_params):
-                    continue
-
-                param_groups.append({
-                    'params': group_params[start_idx:end_idx],
-                    'update_buffer': [
-                        torch.empty(size, device='cuda', dtype=torch.bfloat16)
-                        for _ in range(self.world_size)
-                    ],
-                })
-
+        param_groups = [
+            {
+                'params': [p for p in params if p.numel() == size],
+                'update_buffer': [
+                    torch.empty(size, device='cuda', dtype=torch.bfloat16)
+                    for _ in range(self.world_size)
+                ],
+            }
+            for size in sizes
+        ]
         super().__init__(param_groups, defaults)
 
     def step(self):
+
         for group in self.param_groups:
-            if not group['params']:  # Skip empty groups
-                continue
 
             lr = group['lr']
             momentum = group['momentum']
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
             update_buffers = group['update_buffer']
+            # generate weight updates in distributed fashion
             params = group['params']
-
+            assert len(params) % self.world_size == 0
             handle = None
             params_world = None
-
             def update_prev():
                 if params_world is None:
                     return
@@ -112,8 +123,8 @@ class Muon(torch.optim.Optimizer):
                         g_world.view_as(p_world),
                         alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
                     )
-
-            for p in params:
+            for base_i in range(len(params))[::self.world_size]:
+                p = params[base_i + self.rank]
                 g = p.grad
                 assert g is not None
                 state = self.state[p]
@@ -125,8 +136,7 @@ class Muon(torch.optim.Optimizer):
                 g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
                 update_prev()
                 handle = dist.all_gather(update_buffers, g, async_op=True)
-                params_world = [p]
-
+                params_world = params[base_i : base_i + self.world_size]
             update_prev()
 
 # -----------------------------------------------------------------------------
@@ -201,7 +211,6 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-"""
 class MLP(nn.Module):
 
     def __init__(self, dim):
@@ -215,18 +224,6 @@ class MLP(nn.Module):
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
-"""
-
-
-class MLP(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        config = type('Config', (), {'hidden_size': dim, 'intermediate_size': 4 * dim, 'hidden_act': 'silu'})()
-        self.swiglum = LigerSwiGLUMLP(config)
-
-    def forward(self, x):
-        return self.swiglum(x)
-
 
 
 class Block(nn.Module):
@@ -272,7 +269,7 @@ class GPT(nn.Module):
         self.value_embeds = nn.Embedding(config.vocab_size, config.model_dim*self.num_encoder_layers)
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
-        self.loss_fn = torch.nn.CrossEntropyLoss() #LigerCrossEntropyLoss()
+        self.loss_fn = torch.nn.CrossEntropyLoss()
 
     def forward(self, inputs, targets, sliding_window_size):
 
@@ -395,13 +392,13 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 16  # 1 # batch size, in sequences, across all devices  # TODO: Return to original
-    sequence_length : int = 32*1024 # sequence length, in tokens  # TODO: Return to original
+    batch_size : int = 8  # 1 # batch size, in sequences, across all devices  # TODO: Return to original
+    sequence_length : int = 64*1024 # sequence length, in tokens  # TODO: Return to original
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
-    initial_clip_val : float = 0.1
+    initial_clip_val : float = 0.05
     autoclip_window_size = 100
     autoclip_percentile = 10.0
     # evaluation and logging hyperparams
