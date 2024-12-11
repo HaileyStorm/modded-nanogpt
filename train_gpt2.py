@@ -396,7 +396,7 @@ class Hyperparameters:
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
-    initial_clip_val : float = 0.65
+    clip_val : float = 0.8
     # evaluation and logging hyperparams
     val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 #1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
@@ -582,7 +582,7 @@ for step in range(args.num_iterations + 1):
     for group in optimizer3.param_groups:
         group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # Apply gradient clipping
-    torch.nn.utils.clip_grad_norm_(scalar_params, args.initial_clip_val)
+    torch.nn.utils.clip_grad_norm_(scalar_params, args.clip_val)
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
