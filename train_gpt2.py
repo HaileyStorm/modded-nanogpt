@@ -30,38 +30,60 @@ import math
 
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
     assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    # Convert to bfloat16 once
-    X = G.to(torch.bfloat16)
-
-    # Precompute normalization factor
-    norm_val = X.norm() + eps
-    X /= norm_val
-
-    transpose = (G.size(0) > G.size(1))
-    if transpose:
-        X = X.transpose(0, 1)
-
-    # In-place computations
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
     for _ in range(steps):
-        A = X @ X.transpose(0, 1)  # (M, M)
-        AA = A @ A                  # (M, M)
-        # B = b*A + c*(A@A)
-        A.mul_(b).add_(AA, alpha=c)
-        # X = a*X + B@X
-        BX = A @ X
-        X.mul_(a).add_(BX)
-
-    if transpose:
-        X = X.transpose(0, 1)
-
+        A = X @ X.T
+        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
     return X
 
 class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
         self.world_size = int(os.environ['WORLD_SIZE'])
         self.rank = int(os.environ['RANK'])
+        self.momentum_sp = momentum  # set-point momentum
+        self.momentum_warmup = 250  # warmup steps
+        self.steps_since_reset = 0  # steps since optimizer reset
+        self.clip_val = 0.65  # gradient clipping value
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params = list(params)
         assert all(isinstance(p, torch.Tensor) for p in params)
@@ -78,58 +100,78 @@ class Muon(torch.optim.Optimizer):
         ]
         super().__init__(param_groups, defaults)
 
-    @torch.no_grad()
     def step(self):
+        # Gradient clipping and norm calculation
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            sum([group['params'] for group in self.param_groups], []),
+            self.clip_val
+        )
+
+        # Dynamic momentum adjustment logic
+        current_step = self.steps_since_reset
+        self.steps_since_reset += 1
+
+        # Momentum warmup
+        if current_step <= self.momentum_warmup:
+            frac = min(current_step / self.momentum_warmup, 1.0)
+            initial = 0.895 * self.momentum_sp
+            current_momentum = (1 - frac) * initial + frac * self.momentum_sp
+        else:
+            # Dynamic momentum after warmup
+            if current_step >= self.momentum_warmup * 10:
+                norm_ratio = (total_norm * 0.9125) / self.clip_val
+                norm_factor = max(0.9825, min(1.0475, norm_ratio ** 0.1375))
+                current_momentum = self.momentum_sp * norm_factor
+
+                # Momentum bounds
+                momentum_min = 0.9 * self.momentum_sp
+                momentum_max = 0.99
+                current_momentum = max(momentum_min, min(momentum_max, current_momentum))
+
+                # Smoothing
+                new_base_momentum = (self.momentum_sp * 4.0 + current_momentum + self.momentum_sp) / 6.0
+                current_momentum = (current_momentum * 5.0 + self.momentum_sp) / 6.0
+                current_momentum = max(momentum_min, min(momentum_max, current_momentum))
+                self.momentum_sp = max(momentum_min, min(momentum_max, new_base_momentum))
+            else:
+                current_momentum = self.momentum_sp
+
+        momentum = current_momentum
         for group in self.param_groups:
             lr = group['lr']
-            momentum = group['momentum']
+            group['momentum'] = current_momentum
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
             update_buffers = group['update_buffer']
+            # generate weight updates in distributed fashion
             params = group['params']
-
             assert len(params) % self.world_size == 0
             handle = None
             params_world = None
-
             def update_prev():
-                if params_world is not None:
-                    # Wait for the previous communication to complete
-                    assert handle is not None
-                    handle.wait()
-                    # Apply updates in-place without gradients
-                    for p_world, g_world in zip(params_world, update_buffers):
-                        alpha_factor = -lr * (max(1, p_world.size(0) / p_world.size(1)) ** 0.5)
-                        p_world.add_(g_world.view_as(p_world), alpha=alpha_factor)
-
-            for base_i in range(0, len(params), self.world_size):
+                if params_world is None:
+                    return
+                assert handle is not None
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_buffers):
+                    p_world.data.add_(
+                        g_world.view_as(p_world),
+                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
+                    )
+            for base_i in range(len(params))[::self.world_size]:
                 p = params[base_i + self.rank]
                 g = p.grad
                 assert g is not None
-
                 state = self.state[p]
                 if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g, memory_format=torch.preserve_format)
-
+                    state['momentum_buffer'] = torch.zeros_like(g)
                 buf = state['momentum_buffer']
-                # Momentum update in-place
                 buf.lerp_(g, 1 - momentum)
-                if nesterov:
-                    # g = g + momentum * (buf - g) = lerp_(buf, g, momentum)
-                    # to avoid extra alloc: g <- buf + momentum*(buf-g) = buf*(1+momentum)-momentum*g
-                    # Simpler: g = g.lerp_(buf, momentum)
-                    g = g.lerp_(buf, momentum)
-                else:
-                    g = buf
-
-                # Orthogonalize
+                g = g.lerp_(buf, momentum) if nesterov else buf
                 g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
-
-                # Communication and application
                 update_prev()
                 handle = dist.all_gather(update_buffers, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
-
             update_prev()
 
 
@@ -572,10 +614,6 @@ for step in range(args.num_iterations + 1):
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step/300, 1)
-    for group in optimizer3.param_groups:
-        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
