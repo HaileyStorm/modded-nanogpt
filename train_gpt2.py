@@ -65,31 +65,33 @@ class Muon(torch.optim.Optimizer):
         params = list(params)
         assert all(isinstance(p, torch.Tensor) for p in params)
         sizes = {p.numel() for p in params}
-        param_groups = []
 
+        param_groups = []
         for size in sizes:
             group_params = [p for p in params if p.numel() == size]
-            num_params = len(group_params)
-            padding = (self.world_size - (num_params % self.world_size)) % self.world_size
+            params_per_rank = (len(group_params) + self.world_size - 1) // self.world_size
 
-            # Add dummy parameters if necessary
-            for _ in range(padding):
-                dummy = torch.nn.Parameter(torch.zeros_like(group_params[0]))
-                dummy.requires_grad = False
-                group_params.append(dummy)
+            for rank in range(self.world_size):
+                start_idx = rank * params_per_rank
+                end_idx = min((rank + 1) * params_per_rank, len(group_params))
+                if start_idx >= len(group_params):
+                    continue
 
-            param_groups.append({
-                'params': group_params,
-                'update_buffer': [
-                    torch.empty(size, device='cuda', dtype=torch.bfloat16)
-                    for _ in range(self.world_size)
-                ],
-            })
+                param_groups.append({
+                    'params': group_params[start_idx:end_idx],
+                    'update_buffer': [
+                        torch.empty(size, device='cuda', dtype=torch.bfloat16)
+                        for _ in range(self.world_size)
+                    ],
+                })
 
         super().__init__(param_groups, defaults)
 
     def step(self):
         for group in self.param_groups:
+            if not group['params']:  # Skip empty groups
+                continue
+
             lr = group['lr']
             momentum = group['momentum']
             nesterov = group['nesterov']
@@ -97,7 +99,6 @@ class Muon(torch.optim.Optimizer):
             update_buffers = group['update_buffer']
             params = group['params']
 
-            assert len(params) % self.world_size == 0
             handle = None
             params_world = None
 
@@ -107,17 +108,12 @@ class Muon(torch.optim.Optimizer):
                 assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffers):
-                    if not p_world.requires_grad:
-                        continue  # Skip dummy parameters
                     p_world.data.add_(
                         g_world.view_as(p_world),
                         alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
                     )
 
-            for base_i in range(len(params))[::self.world_size]:
-                p = params[base_i + self.rank]
-                if not p.requires_grad:
-                    continue  # Skip dummy parameters
+            for p in params:
                 g = p.grad
                 assert g is not None
                 state = self.state[p]
@@ -129,7 +125,8 @@ class Muon(torch.optim.Optimizer):
                 g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
                 update_prev()
                 handle = dist.all_gather(update_buffers, g, async_op=True)
-                params_world = params[base_i: base_i + self.world_size]
+                params_world = [p]
+
             update_prev()
 
 # -----------------------------------------------------------------------------
