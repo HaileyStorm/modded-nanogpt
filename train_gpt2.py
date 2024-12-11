@@ -154,7 +154,7 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype))
 
 
-"""
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -178,31 +178,6 @@ class Rotary(torch.nn.Module):
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x)
-"""
-
-
-class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000):
-        super().__init__()
-        self.dim = dim
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
-
-    def forward(self, q, k):
-        seq_len = q.shape[1]
-        if seq_len != self.seq_len_cached:
-            t = torch.arange(seq_len, device=q.device).type_as(self.inv_freq)
-            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            self.cos_cached = emb.cos()[None, :, None, :]  # [1, seq_len, 1, dim]
-            self.sin_cached = emb.sin()[None, :, None, :]  # [1, seq_len, 1, dim]
-            self.seq_len_cached = seq_len
-
-        return (q * self.cos_cached + torch.roll(q, shifts=1, dims=-1) * self.sin_cached,
-                k * self.cos_cached + torch.roll(k, shifts=1, dims=-1) * self.sin_cached)
 
 
 class CausalSelfAttention(nn.Module):
@@ -228,9 +203,7 @@ class CausalSelfAttention(nn.Module):
         v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
 
-        #q, k = self.rotary(q), self.rotary(k)
-        #y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
-        q, k = self.rotary(q, k)
+        q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
 
         y = y.transpose(1, 2).contiguous().view_as(x)  # re-assemble all head outputs side by side
@@ -238,6 +211,7 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+"""
 class MLP(nn.Module):
 
     def __init__(self, dim):
@@ -251,8 +225,9 @@ class MLP(nn.Module):
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
-
 """
+
+
 class MLP(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -261,7 +236,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.swiglum(x)
-"""
+
 
 
 class Block(nn.Module):
