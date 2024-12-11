@@ -198,11 +198,12 @@ class Rotary(torch.nn.Module):
             t = torch.arange(seq_len, device=q.device).type_as(self.inv_freq)
             freqs = torch.einsum('i,j->ij', t, self.inv_freq)
             emb = torch.cat((freqs, freqs), dim=-1)
-            self.cos_cached = emb.cos().unsqueeze(0)  # [1, seq_len, dim]
-            self.sin_cached = emb.sin().unsqueeze(0)  # [1, seq_len, dim]
+            self.cos_cached = emb.cos()[None, :, None, :]  # [1, seq_len, 1, dim]
+            self.sin_cached = emb.sin()[None, :, None, :]  # [1, seq_len, 1, dim]
             self.seq_len_cached = seq_len
-        return liger_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), self.cos_cached, self.sin_cached)
 
+        return (q * self.cos_cached + torch.roll(q, shifts=1, dims=-1) * self.sin_cached,
+                k * self.cos_cached + torch.roll(k, shifts=1, dims=-1) * self.sin_cached)
 
 
 class CausalSelfAttention(nn.Module):
@@ -430,8 +431,8 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 32  # 1 # batch size, in sequences, across all devices  # TODO: Return to original
-    sequence_length : int = 16*1024 # sequence length, in tokens  # TODO: Return to original
+    batch_size : int = 16  # 1 # batch size, in sequences, across all devices  # TODO: Return to original
+    sequence_length : int = 32*1024 # sequence length, in tokens  # TODO: Return to original
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
