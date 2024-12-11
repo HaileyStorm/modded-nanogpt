@@ -16,6 +16,17 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from liger_kernel.transformers import LigerRMSNorm, liger_rotary_pos_emb, LigerSwiGLUMLP, LigerCrossEntropyLoss
+import numpy as np
+from collections import deque
+import math
+
+###########################################################################
+# OPTIMIZATION TESTS
+###########################################################################
+# AutoClip settings
+use_autoclip = False
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -142,6 +153,8 @@ class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
 
+
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -166,6 +179,31 @@ class Rotary(torch.nn.Module):
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x)
 
+
+"""
+class Rotary(torch.nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.dim = dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, q, k):
+        seq_len = q.shape[1]
+        if seq_len != self.seq_len_cached:
+            t = torch.arange(seq_len, device=q.device).type_as(self.inv_freq)
+            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self.cos_cached = emb.cos().unsqueeze(0)  # [1, seq_len, dim]
+            self.sin_cached = emb.sin().unsqueeze(0)  # [1, seq_len, dim]
+            self.seq_len_cached = seq_len
+        return liger_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), self.cos_cached, self.sin_cached)
+"""
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, dim, num_heads):
@@ -188,11 +226,16 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.num_heads, -1)
         v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
+
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
-        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        #q, k = self.rotary(q, k)
+        #y = flex_attention(q, k, v.transpose(1, 2), block_mask=block_mask)
+
+        y = y.transpose(1, 2).contiguous().view_as(x)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
+
 
 class MLP(nn.Module):
 
@@ -207,6 +250,18 @@ class MLP(nn.Module):
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
+
+"""
+class MLP(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        config = type('Config', (), {'hidden_size': dim, 'intermediate_size': 4 * dim, 'hidden_act': 'silu'})()
+        self.swiglum = LigerSwiGLUMLP(config)
+
+    def forward(self, x):
+        return self.swiglum(x)
+"""
+
 
 class Block(nn.Module):
 
@@ -251,6 +306,7 @@ class GPT(nn.Module):
         self.value_embeds = nn.Embedding(config.vocab_size, config.model_dim*self.num_encoder_layers)
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
+        self.loss_fn = torch.nn.CrossEntropyLoss() #LigerCrossEntropyLoss()
 
     def forward(self, inputs, targets, sliding_window_size):
 
@@ -303,7 +359,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = self.loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
         return loss
 
 # -----------------------------------------------------------------------------
@@ -373,15 +429,18 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8 # batch size, in sequences, across all devices
-    sequence_length : int = 64*1024 # sequence length, in tokens
+    batch_size : int = 8  # 1 # batch size, in sequences, across all devices  # TODO: Return to original
+    sequence_length : int = 64*1024 # sequence length, in tokens  # TODO: Return to original
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
+    initial_clip_val : float = 0.1
+    autoclip_window_size = 100
+    autoclip_percentile = 10.0
     # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 10485760 #1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
@@ -418,10 +477,13 @@ def print0(s, logonly=False):
 # and print the full `nvidia-smi` to file
 print0(f"Running python {sys.version}")
 print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
+
+# TODO: Uncomment
 import subprocess
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
+
 
 # calculate the number of steps to take in the val loop.
 assert args.val_tokens % (args.sequence_length * ddp_world_size) == 0
@@ -465,17 +527,33 @@ optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
+    warmdown_start = args.num_iterations - args.cooldown_iters
     # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters:
         return (it+1) / args.warmup_iters
     # 2) constant lr for a while
-    elif it < args.num_iterations - args.cooldown_iters:
+    elif it < warmdown_start:
         return 1.0
     # 3) linear cooldown
     else:
         decay_ratio = (args.num_iterations - it) / args.cooldown_iters
         return decay_ratio
+
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+if use_autoclip:
+    grad_norm_window = deque(maxlen=args.autoclip_window_size)
+
+def autoclip(parameters):
+    if not use_autoclip:
+        return None
+    if len(grad_norm_window) < args.autoclip_window_size:
+        clip_value = args.initial_clip_val
+    else:
+        clip_value = np.percentile(list(grad_norm_window), args.autoclip_percentile)
+    total_norm = torch.nn.utils.clip_grad_norm_(parameters, clip_value)
+    grad_norm_window.append(total_norm.item())
+    return total_norm.item(), clip_value
 
 sliding_window_size = torch.tensor(64, dtype=torch.int32, device="cuda")
 sw_size_prev = 64
@@ -519,6 +597,7 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -529,7 +608,7 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.perf_counter() - t0)
         # save the state of the training process
         log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        #torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -557,6 +636,8 @@ for step in range(args.num_iterations + 1):
     frac = min(step/300, 1)
     for group in optimizer3.param_groups:
         group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    # Apply AutoClip to scalar_params, if enabled
+    current_grad_norm, current_clip_val = autoclip(scalar_params)
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -566,7 +647,10 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+    step_info = f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms"
+    if use_autoclip:
+        step_info += f" grad_norm:{current_grad_norm:.4f}, clip_val:{current_clip_val:.4f}"
+    print0(step_info)
 
 print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
