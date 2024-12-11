@@ -4,3 +4,4 @@ torch
 huggingface-hub
 liger-kernel
 triton >= 2.3.0
+transformers
