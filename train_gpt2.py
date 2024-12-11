@@ -399,7 +399,7 @@ class Hyperparameters:
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     initial_clip_val : float = 0.65
-    autoclip_window_size = 50
+    autoclip_window_size = 150
     autoclip_percentile = 10.0
     # evaluation and logging hyperparams
     val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
