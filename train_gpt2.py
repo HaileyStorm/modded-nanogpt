@@ -56,30 +56,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         X = X.T
     return X
 
+
 class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
-    """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
         self.world_size = int(os.environ['WORLD_SIZE'])
         self.rank = int(os.environ['RANK'])
@@ -88,16 +66,17 @@ class Muon(torch.optim.Optimizer):
         assert all(isinstance(p, torch.Tensor) for p in params)
         sizes = {p.numel() for p in params}
         param_groups = []
+
         for size in sizes:
             group_params = [p for p in params if p.numel() == size]
-            remainder = len(group_params) % self.world_size
-            if remainder != 0:
-                # Add dummy parameters
-                padding_size = self.world_size - remainder
-                for _ in range(padding_size):
-                    dummy_param = nn.Parameter(torch.empty(1, device='cuda', dtype=torch.bfloat16))
-                    dummy_param.requires_grad = False  # Don't compute gradients for dummy params
-                    group_params.append(dummy_param)
+            num_params = len(group_params)
+            padding = (self.world_size - (num_params % self.world_size)) % self.world_size
+
+            # Add dummy parameters if necessary
+            for _ in range(padding):
+                dummy = torch.nn.Parameter(torch.zeros_like(group_params[0]))
+                dummy.requires_grad = False
+                group_params.append(dummy)
 
             param_groups.append({
                 'params': group_params,
@@ -105,35 +84,40 @@ class Muon(torch.optim.Optimizer):
                     torch.empty(size, device='cuda', dtype=torch.bfloat16)
                     for _ in range(self.world_size)
                 ],
-            })  # TODO: Make sure this gets included in clean
+            })
+
         super().__init__(param_groups, defaults)
 
     def step(self):
-
         for group in self.param_groups:
-
             lr = group['lr']
             momentum = group['momentum']
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
             update_buffers = group['update_buffer']
-            # generate weight updates in distributed fashion
             params = group['params']
+
             assert len(params) % self.world_size == 0
             handle = None
             params_world = None
+
             def update_prev():
                 if params_world is None:
                     return
                 assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffers):
+                    if not p_world.requires_grad:
+                        continue  # Skip dummy parameters
                     p_world.data.add_(
                         g_world.view_as(p_world),
                         alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
                     )
+
             for base_i in range(len(params))[::self.world_size]:
                 p = params[base_i + self.rank]
+                if not p.requires_grad:
+                    continue  # Skip dummy parameters
                 g = p.grad
                 assert g is not None
                 state = self.state[p]
@@ -145,7 +129,7 @@ class Muon(torch.optim.Optimizer):
                 g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
                 update_prev()
                 handle = dist.all_gather(update_buffers, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
+                params_world = params[base_i: base_i + self.world_size]
             update_prev()
 
 # -----------------------------------------------------------------------------
