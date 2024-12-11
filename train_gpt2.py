@@ -546,7 +546,7 @@ if use_autoclip:
 
 def autoclip(parameters):
     if not use_autoclip:
-        return None
+        return None, None
     if len(grad_norm_window) < args.autoclip_window_size:
         clip_value = args.initial_clip_val
     else:
