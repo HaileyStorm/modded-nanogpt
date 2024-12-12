@@ -107,25 +107,6 @@ class Muon(torch.optim.Optimizer):
             update_buffers = group['update_buffer']
             # generate weight updates in distributed fashion
             params = group['params']
-
-            # Clip gradients
-            clip_val = 0.65
-            total_norm = torch.nn.utils.clip_grad_norm_(params, clip_val)
-
-            # Dynamic momentum adjustment
-            norm_ratio = (total_norm * 0.885) / clip_val
-            norm_factor = max(0.9825, min(1.0475, norm_ratio ** 0.1375))
-            current_momentum = momentum * norm_factor
-
-            # Momentum bounds
-            momentum_min = 0.9 * 0.95  # 90% of default 0.95
-            momentum_max = 0.99
-            current_momentum = max(momentum_min, min(momentum_max, current_momentum))
-
-            # "Smoothing"
-            new_base_momentum = (0.95 * 4.0 + current_momentum + momentum) / 6.0
-            group['momentum'] = max(momentum_min, min(momentum_max, new_base_momentum))
-
             assert len(params) % self.world_size == 0
             handle = None
             params_world = None
@@ -206,7 +187,7 @@ class CausalSelfAttention(nn.Module):
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.lambdas = nn.Parameter(torch.tensor([0.75, 0.75]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -249,7 +230,7 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
         self.mlp = MLP(config.model_dim)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.25]))
 
     def forward(self, x, vi, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
@@ -277,7 +258,7 @@ class GPT(nn.Module):
         self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        self.skip_weights = nn.Parameter(torch.full((self.decoder_layers,), 0.25))
 
         self.embed = nn.Embedding(config.vocab_size, config.model_dim)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
@@ -595,10 +576,10 @@ for step in range(args.num_iterations + 1):
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
+    # momentum warmup for Muon
+    frac = min(step / 300, 1)
     for group in optimizer3.param_groups:
-        frac = min(step / 300, 1)
-        initial = 0.895 * 0.95  # 85% of default momentum
-        group['momentum'] = (1 - frac) * initial + frac * 0.95
+        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
