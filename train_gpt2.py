@@ -113,7 +113,7 @@ class Muon(torch.optim.Optimizer):
             total_norm = torch.nn.utils.clip_grad_norm_(params, clip_val)
 
             # Dynamic momentum adjustment
-            norm_ratio = (total_norm * 0.9125) / clip_val
+            norm_ratio = (total_norm * 0.925) / clip_val
             norm_factor = max(0.9825, min(1.0475, norm_ratio ** 0.1375))
             current_momentum = momentum * norm_factor
 
@@ -124,8 +124,6 @@ class Muon(torch.optim.Optimizer):
 
             # "Smoothing"
             new_base_momentum = (0.95 * 4.0 + current_momentum + momentum) / 6.0
-            current_momentum = (current_momentum * 5.0 + momentum) / 6.0
-            current_momentum = max(momentum_min, min(momentum_max, current_momentum))
             group['momentum'] = max(momentum_min, min(momentum_max, new_base_momentum))
 
             assert len(params) % self.world_size == 0
