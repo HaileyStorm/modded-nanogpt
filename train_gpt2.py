@@ -187,7 +187,7 @@ class CausalSelfAttention(nn.Module):
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
-        self.lambdas = nn.Parameter(torch.tensor([0.75, 0.75]))
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -230,7 +230,7 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
         self.mlp = MLP(config.model_dim)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.25]))
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, vi, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
@@ -258,7 +258,7 @@ class GPT(nn.Module):
         self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.full((self.num_decoder_layers,), 0.25))
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
         self.embed = nn.Embedding(config.vocab_size, config.model_dim)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
