@@ -113,7 +113,7 @@ class Muon(torch.optim.Optimizer):
             total_norm = torch.nn.utils.clip_grad_norm_(params, clip_val)
 
             # Dynamic momentum adjustment
-            norm_ratio = (total_norm * 0.925) / clip_val
+            norm_ratio = (total_norm * 0.9) / clip_val
             norm_factor = max(0.9825, min(1.0475, norm_ratio ** 0.1375))
             current_momentum = momentum * norm_factor
 
