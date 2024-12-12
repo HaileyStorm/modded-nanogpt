@@ -125,7 +125,7 @@ class Muon(torch.optim.Optimizer):
             # "Smoothing"
             new_base_momentum = (0.95 * 4.0 + current_momentum + momentum) / 6.0
             current_momentum = (current_momentum * 5.0 + momentum) / 6.0
-            current_momentum = max(momentum_min, min(momentum_max, current_momentum))
+            momentum = max(momentum_min, min(momentum_max, current_momentum))
             group['momentum'] = max(momentum_min, min(momentum_max, new_base_momentum))
 
             assert len(params) % self.world_size == 0
