@@ -258,7 +258,7 @@ class GPT(nn.Module):
         self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.full((self.decoder_layers,), 0.25))
+        self.skip_weights = nn.Parameter(torch.full((self.num_decoder_layers,), 0.25))
 
         self.embed = nn.Embedding(config.vocab_size, config.model_dim)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
