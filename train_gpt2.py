@@ -562,12 +562,10 @@ def get_lr_cosine(it):
     # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters_cosine:
         lr = it / args.warmup_iters_cosine
-        print(lr)
         return lr
     # 2) cosine decay
     progress = (it - args.warmup_iters_cosine) / (args.num_iterations - args.warmup_iters_cosine)
     lr = 0.5 * (1.0 + math.cos(math.pi * progress))
-    print(lr)
     return lr
 
 
