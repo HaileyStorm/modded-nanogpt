@@ -443,7 +443,7 @@ class Hyperparameters:
     sequence_length: int = 64 * 1024  # sequence length, in tokens
     num_iterations: int = 1480  # number of iterations to run
     warmup_iters_wsd: int = 0
-    warmup_iters_cosine: int = 300
+    warmup_iters_cosine: int = 0
     cooldown_iters: int = 600  # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay: float = 0
     # evaluation and logging hyperparams
