@@ -443,7 +443,8 @@ class Hyperparameters:
     sequence_length: int = 64 * 1024  # sequence length, in tokens
     num_iterations: int = 1480  # number of iterations to run
     warmup_iters_wsd: int = 0
-    warmup_iters_cosine: int = 15
+    warmup_iters_cosine: int = 67
+    init_lr_pct_cosine: float = 0.667
     cooldown_iters: int = 600  # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay: float = 0
     # evaluation and logging hyperparams
@@ -561,7 +562,8 @@ def get_lr_wsd(it):
 def get_lr_cosine(it):
     # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters_cosine:
-        lr = it / args.warmup_iters_cosine
+        #lr = it / args.warmup_iters_cosine
+        lr = args.init_lr_pct_cosine + (1.0 - args.init_lr_pct_cosine) * (it / args.warmup_iters_cosine)
         return lr
     # 2) cosine decay
     progress = (it - args.warmup_iters_cosine) / (args.num_iterations - args.warmup_iters_cosine)
