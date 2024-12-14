@@ -388,15 +388,15 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 1  # 8 # batch size, in sequences, across all devices  # TODO: Return to original
-    sequence_length : int = 10*1024 # sequence length, in tokens  # TODO: Return to original
+    batch_size : int = 4  # 8 # batch size, in sequences, across all devices  # TODO: Return to original
+    sequence_length : int = 128*1024 # sequence length, in tokens  # TODO: Return to original
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
+    val_tokens : int = 10485760 #1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
