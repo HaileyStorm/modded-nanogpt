@@ -152,30 +152,39 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype))
 
 
-
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
+        half_dim = dim // 2
+        inv_freq = 1.0 / (base ** (torch.arange(0, half_dim).float() / half_dim))
+        self.register_buffer('inv_freq', inv_freq)
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
+        self.freqs_cis_cached = None
 
     def forward(self, x):
         seq_len = x.shape[1]
+
         if seq_len != self.seq_len_cached:
-            t = torch.arange(seq_len, device=x.device)
-            freqs = torch.outer(t, self.inv_freq)
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.einsum('i,j->ij', t, self.inv_freq).float()
+            self.freqs_cis_cached = torch.polar(torch.ones_like(freqs), freqs)
             self.seq_len_cached = seq_len
-            self.cos_cached = freqs.cos()
-            self.sin_cached = freqs.sin()
-        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-        # apply_rotary_emb(x, cos, sin)
-        x1, x2 = x.chunk(2, dim=3)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x)
+
+        # Reshape x for processing
+        x_squeeze = x.float().reshape(*x.shape[:-1], -1, 2)
+        x_complex = torch.complex(x_squeeze[..., 0], x_squeeze[..., 1])
+
+        # Apply rotation
+        x_rotated = x_complex * self.freqs_cis_cached.unsqueeze(0).unsqueeze(2)
+
+        # Convert back to real tensor
+        x_out = torch.stack((x_rotated.real, x_rotated.imag), dim=-1)
+
+        return x_out.reshape(*x_out.shape[:-2], -1).type_as(x)
+
 
 
 class CausalSelfAttention(nn.Module):
@@ -203,9 +212,59 @@ class CausalSelfAttention(nn.Module):
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
 
-        y = y.bfloat16().transpose(1, 2).contiguous().view_as(x)  # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view_as(x)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
+
+
+"""
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.c_q = CastedLinear(dim, dim)
+        self.c_k = CastedLinear(dim, dim)
+        self.c_v = CastedLinear(dim, dim)
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.rotary = Rotary(self.head_dim)  # Using head_dim as discussed
+        self.c_proj = CastedLinear(dim, dim)
+        self.c_proj.weight.data.zero_()  # zero init
+
+    def forward(self, x, vi, block_mask):
+        B, T = x.size(0), x.size(1)  # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+
+        # Linear projections
+        q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.c_k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.c_v(x).view(B, T, self.num_heads, self.head_dim)
+
+        # Apply lambda weighting to value
+        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v)
+
+        # QK normalization
+        q, k = norm(q), norm(k)
+
+        # Apply rotary embeddings
+        q, k = self.rotary(q), self.rotary(k)
+
+        # Compute attention scores
+        # We'll use flex_attention here as you have it, but let's prepare the tensors correctly
+        q = q.transpose(1, 2)  # (B, num_heads, T, head_dim)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        y = flex_attention(q, k, v, block_mask=block_mask)
+
+        # Reassemble heads and project
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, dim)
+        y = self.c_proj(y)
+
+        return y
+"""
 
 
 class MLP(nn.Module):
@@ -389,15 +448,15 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8  # 1 # batch size, in sequences, across all devices  # TODO: Return to original
-    sequence_length : int = 64*1024 # sequence length, in tokens  # TODO: Return to original
+    batch_size : int = 1  # 8 # batch size, in sequences, across all devices  # TODO: Return to original
+    sequence_length : int = 10*1024 # sequence length, in tokens  # TODO: Return to original
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 #1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
+    val_tokens : int = 1638400 #3112960 #10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons  # TODO: Return to original
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
@@ -436,10 +495,10 @@ print0(f"Running python {sys.version}")
 print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
 
 # TODO: Uncomment
-import subprocess
-result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-print0(f'{result.stdout}', logonly=True)
-print0('='*100, logonly=True)
+#import subprocess
+#result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+#print0(f'{result.stdout}', logonly=True)
+#print0('='*100, logonly=True)
 
 
 # calculate the number of steps to take in the val loop.
