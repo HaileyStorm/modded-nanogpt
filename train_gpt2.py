@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 
@@ -441,7 +442,8 @@ class Hyperparameters:
     batch_size: int = 8  # batch size, in sequences, across all devices
     sequence_length: int = 64 * 1024  # sequence length, in tokens
     num_iterations: int = 1480  # number of iterations to run
-    warmup_iters: int = 0
+    warmup_iters_wsd: int = 0
+    warmup_iters_cosine: int = 300
     cooldown_iters: int = 600  # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay: float = 0
     # evaluation and logging hyperparams
@@ -536,17 +538,17 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 
 params = list(raw_model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = torch.optim.AdamW(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True, weight_decay=0.025)
+optimizer3 = torch.optim.AdamW(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
 optimizer4 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 
 
 # learning rate decay scheduler (linear warmup and cooldown)
-def get_lr(it):
+def get_lr_wsd(it):
     assert it <= args.num_iterations
     # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it + 1) / args.warmup_iters
+    if it < args.warmup_iters_wsd:
+        return (it + 1) / args.warmup_iters_wsd
     # 2) constant lr for a while
     elif it < args.num_iterations - args.cooldown_iters:
         return 1.0
@@ -556,7 +558,25 @@ def get_lr(it):
         return decay_ratio
 
 
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+def get_lr_cosine(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_iters_cosine:
+        lr = it / args.warmup_iters_cosine
+        print(lr)
+        return lr
+    # 2) cosine decay
+    progress = (it - args.warmup_iters_cosine) / (args.num_iterations - args.warmup_iters_cosine)
+    lr = 0.5 * (1.0 + math.cos(math.pi * progress))
+    print(lr)
+    return lr
+
+
+schedulers = []
+for i, opt in enumerate(optimizers):
+    if i == len(optimizers)-1:  # Muon optimizer
+        schedulers.append(torch.optim.lr_scheduler.LambdaLR(opt, get_lr_wsd))
+    else:  # Adam(W) optimizers
+        schedulers.append(torch.optim.lr_scheduler.LambdaLR(opt, get_lr_cosine))
 
 sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device="cuda")
 sw_num_blocks_prev = 1
@@ -637,10 +657,11 @@ for step in range(args.num_iterations + 1):
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step / 300, 1)
-    for group in optimizer4.param_groups:
-        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    if step < 301:
+        # momentum warmup for Muon
+        frac = min(step / 300, 1)
+        for group in optimizer4.param_groups:
+            group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
