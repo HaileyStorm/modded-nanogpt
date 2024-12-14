@@ -175,7 +175,6 @@ class Rotary(torch.nn.Module):
         self.sin_cached = None
         self.freqs_cis_cached = None
 
-    @torch.compiler.disable(recursive=False)
     def forward(self, x):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
