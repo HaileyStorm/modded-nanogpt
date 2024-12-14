@@ -198,26 +198,36 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
+        self.head_dim = dim // num_heads
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(dim // num_heads)  # dim // num_heads = head_dim
+        self.rotary = Rotary(self.head_dim)  # Using head_dim as discussed
         self.c_proj = CastedLinear(dim, dim)
-        self.c_proj.weight.data.zero_()  # zero init suggested by @Grad62304977
+        self.c_proj.weight.data.zero_()  # zero init
 
     def forward(self, x, vi, block_mask):
         B, T = x.size(0), x.size(1)  # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.num_heads, -1)
-        k = self.c_k(x).view(B, T, self.num_heads, -1)
-        v = self.c_v(x).view(B, T, self.num_heads, -1)
-        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v)  # @KoszarskyB & @Grad62304977
-        q, k = norm(q), norm(k)  # QK norm @Grad62304977
+        # Linear projections
+        q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.c_k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.c_v(x).view(B, T, self.num_heads, self.head_dim)
+        # Apply lambda weighting to value
+        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v)
+        # QK normalization
+        q, k = norm(q), norm(k)
+        # Apply rotary embeddings
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask,
-                           enable_gqa=True)
-        y = y.transpose(1, 2).contiguous().view_as(x)  # re-assemble all head outputs side by side
+        # Compute attention scores
+        # We'll use flex_attention here as you have it, but let's prepare the tensors correctly
+        q = q.transpose(1, 2)  # (B, num_heads, T, head_dim)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        y = flex_attention(q, k, v, block_mask=block_mask)
+        # Reassemble heads and project
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, dim)
         y = self.c_proj(y)
         return y
 
