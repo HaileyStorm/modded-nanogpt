@@ -167,29 +167,25 @@ class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        half_dim = dim // 2
-        inv_freq = 1.0 / (base ** (torch.arange(0, half_dim).float() / half_dim))
-        self.register_buffer('inv_freq', inv_freq)
+        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
-        self.freqs_cis_cached = None
 
     def forward(self, x):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.einsum('i,j->ij', t, self.inv_freq).float()
-            self.freqs_cis_cached = torch.polar(torch.ones_like(freqs), freqs)
+            t = torch.arange(seq_len, device=x.device)
+            freqs = torch.outer(t, self.inv_freq)
             self.seq_len_cached = seq_len
-        # Reshape x for processing
-        x_squeeze = x.float().reshape(*x.shape[:-1], -1, 2)
-        x_complex = torch.complex(x_squeeze[..., 0], x_squeeze[..., 1])
-        # Apply rotation
-        x_rotated = x_complex * self.freqs_cis_cached.unsqueeze(0).unsqueeze(2)
-        # Convert back to real tensor
-        x_out = torch.stack((x_rotated.real, x_rotated.imag), dim=-1)
-        return x_out.reshape(*x_out.shape[:-2], -1).type_as(x)
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
+        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        # apply_rotary_emb(x, cos, sin)
+        x1, x2 = x.chunk(2, dim=3)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x)
 
 
 class CausalSelfAttention(nn.Module):
