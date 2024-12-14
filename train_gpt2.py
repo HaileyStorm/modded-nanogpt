@@ -186,7 +186,6 @@ class Rotary(torch.nn.Module):
         return x_out.reshape(*x_out.shape[:-2], -1).type_as(x)
 
 
-
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, dim, num_heads):
@@ -215,56 +214,6 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view_as(x)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
-
-
-"""
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        assert dim % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, dim)
-        self.c_v = CastedLinear(dim, dim)
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(self.head_dim)  # Using head_dim as discussed
-        self.c_proj = CastedLinear(dim, dim)
-        self.c_proj.weight.data.zero_()  # zero init
-
-    def forward(self, x, vi, block_mask):
-        B, T = x.size(0), x.size(1)  # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
-
-        # Linear projections
-        q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
-        k = self.c_k(x).view(B, T, self.num_heads, self.head_dim)
-        v = self.c_v(x).view(B, T, self.num_heads, self.head_dim)
-
-        # Apply lambda weighting to value
-        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v)
-
-        # QK normalization
-        q, k = norm(q), norm(k)
-
-        # Apply rotary embeddings
-        q, k = self.rotary(q), self.rotary(k)
-
-        # Compute attention scores
-        # We'll use flex_attention here as you have it, but let's prepare the tensors correctly
-        q = q.transpose(1, 2)  # (B, num_heads, T, head_dim)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        y = flex_attention(q, k, v, block_mask=block_mask)
-
-        # Reassemble heads and project
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, dim)
-        y = self.c_proj(y)
-
-        return y
-"""
 
 
 class MLP(nn.Module):
@@ -537,8 +486,8 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 
 params = list(raw_model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
+optimizer3 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
+optimizer4 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
@@ -636,7 +585,7 @@ for step in range(args.num_iterations + 1):
             p.grad /= train_accumulation_steps
     # momentum warmup for Muon
     frac = min(step / 300, 1)
-    for group in optimizer3.param_groups:
+    for group in optimizer4.param_groups:
         group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
