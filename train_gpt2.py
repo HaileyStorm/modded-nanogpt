@@ -443,8 +443,7 @@ class Hyperparameters:
     sequence_length: int = 64 * 1024  # sequence length, in tokens
     num_iterations: int = 1480  # number of iterations to run
     warmup_iters_wsd: int = 0
-    warmup_iters_cosine: int = 67
-    init_lr_pct_cosine: float = 0.667
+    warmup_iters_cosine: int = 0
     cooldown_iters: int = 600  # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay: float = 0
     # evaluation and logging hyperparams
@@ -534,12 +533,12 @@ raw_model = model.module  # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
 embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
-optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam(embed_params, lr=0.6*1.15, betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008*1.15, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = torch.optim.AdamW(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
+optimizer3 = torch.optim.AdamW(scalar_params, lr=0.04*1.15, betas=(0.8, 0.95), fused=True)
 optimizer4 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 
@@ -562,8 +561,7 @@ def get_lr_wsd(it):
 def get_lr_cosine(it):
     # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters_cosine:
-        #lr = it / args.warmup_iters_cosine
-        lr = args.init_lr_pct_cosine + (1.0 - args.init_lr_pct_cosine) * (it / args.warmup_iters_cosine)
+        lr = it / args.warmup_iters_cosine
         return lr
     # 2) cosine decay
     progress = (it - args.warmup_iters_cosine) / (args.num_iterations - args.warmup_iters_cosine)
