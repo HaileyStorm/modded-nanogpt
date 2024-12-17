@@ -500,7 +500,7 @@ params = list(raw_model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
+optimizer4 = torch.optim.AdamW(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
