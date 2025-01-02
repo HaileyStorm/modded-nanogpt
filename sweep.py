@@ -19,6 +19,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention  # Kosza
 from bayes_opt import BayesianOptimization
 from bayes_opt.event import DEFAULT_EVENTS, Events
 import json
+import math
 
 
 # -----------------------------------------------------------------------------
@@ -157,7 +158,6 @@ class Muon(torch.optim.Optimizer):
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
-
 class CastedLinear(nn.Linear):
 
     def __init__(self, in_features, out_features):
@@ -165,7 +165,6 @@ class CastedLinear(nn.Linear):
 
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
-
 
 class Rotary(nn.Module):
     def __init__(self, dim, max_seq_len=65536):
@@ -183,7 +182,6 @@ class Rotary(nn.Module):
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x)
-
 
 class CausalSelfAttention(nn.Module):
 
@@ -213,28 +211,26 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
-
 class MLP(nn.Module):
 
     def __init__(self, dim):
         super().__init__()
-        self.c_fc = CastedLinear(dim, 4 * dim)
+        self.c_fc   = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
-        self.c_proj.weight.data.zero_()  # zero init suggested by @Grad62304977
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(
-            x).square()  # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
-
 
 class Block(nn.Module):
 
     def __init__(self, config: "GPTConfig", layer_idx: int):
         super().__init__()
-        if layer_idx != 7:
+        self.skip_attn_idx = config.num_layers // 2 + 1
+        if layer_idx != self.skip_attn_idx:
             self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
         self.mlp = MLP(config.model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
@@ -242,54 +238,45 @@ class Block(nn.Module):
 
     def forward(self, x, vi, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        if self.layer_idx != 7:
+        if self.layer_idx != self.skip_attn_idx:
             x = x + self.attn(norm(x), vi, block_mask)
         x = x + self.mlp(norm(x))
         return x
-
 
 class ValueEmbedding(nn.Module):
     def __init__(self, config: "GPTConfig"):
         super().__init__()
         self.embed = nn.ModuleList([
             nn.Embedding(config.vocab_size, config.model_dim)
-            for _ in range(config.num_layers // 2)  # Only for encoder layers
+            for _ in range(6)
         ])
-        self.num_active_encoder_layers = 3
 
     def forward(self, inputs) -> "list[torch.Tensor]":
-        ve = [emb(inputs) for emb in self.embed[:self.num_active_encoder_layers]]
-        ve += list(reversed(ve))  # Mirror for decoder layers
+        ve = [emb(inputs) for emb in self.embed]
+        ve += reversed(ve)
         return ve
-
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
 @dataclass
 class GPTConfig:
-    vocab_size: int = 50304
-    num_layers: int = 12
-    num_heads: int = 6  # head dim 128 suggested by @Grad62304977
-    model_dim: int = 768
-
+    vocab_size : int = 50304
+    num_layers : int = 12
+    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
+    model_dim : int = 768
 
 class GPT(nn.Module):
 
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.current_num_layers = 6  # Start with 6 layers (ABC+JKL)
-        self.target_num_layers = config.num_layers  # 12 layers total
-        self.cached_block_mask = None
-        self.cached_sliding_window = None
+        self.num_layers = config.num_layers
 
         # U-net design by @brendanh0gan
-        self.num_encoder_layers = config.num_layers // 2  # Half of the layers for encoder
-        self.num_decoder_layers = config.num_layers - self.num_encoder_layers  # Remaining for decoder
+        self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.ParameterList([
-            nn.Parameter(torch.ones(1)) for _ in range(self.num_decoder_layers)
-        ])
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
         self.embed = nn.Embedding(config.vocab_size, config.model_dim)
         self.blocks = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.num_layers)])
@@ -297,75 +284,13 @@ class GPT(nn.Module):
         # U-net structure on token value embeddings by @leloykun
         self.value_embeds = ValueEmbedding(config)
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
-        self.lm_head.weight.data.zero_()  # @Grad62304977
-
-        self._freeze_unused_layers()
-
-    def _freeze_unused_layers(self):
-        # Freeze unused block layers
-        active_indices = list(range(3)) + list(range(9, 12))  # ABC and JKL
-        for i in range(12):
-            if i not in active_indices:
-                for param in self.blocks[i].parameters():
-                    param.requires_grad = False
-
-        # Freeze unused value embedding layers
-        for i in range(3, 6):  # Embeddings for layers after C
-            for param in self.value_embeds.embed[i].parameters():
-                param.requires_grad = False
-
-        # Freeze unused skip connections
-        for i in range(3, 6):
-            self.skip_weights[i].requires_grad = False
-
-    def grow_layers(self, step):
-        if step == args.first_growth_step:  # 6 -> 8 (add D and I)
-            self._initialize_layer(3, 2, 9, weights=[2/3, 1/3])  # D
-            self._initialize_layer(8, 2, 9, weights=[1/3, 2/3])  # I
-            self.current_num_layers = 8
-            self.value_embeds.num_active_encoder_layers = 4
-        elif step == args.second_growth_step:  # 8 -> 10 (add E and H)
-            self._initialize_layer(4, 3, 8, weights=[2/3, 1/3])  # E
-            self._initialize_layer(7, 3, 8, weights=[1/3, 2/3])  # H
-            self.current_num_layers = 10
-            self.value_embeds.num_active_encoder_layers = 5
-        elif step == args.third_growth_step:  # 10 -> 12 (add F and G)
-            self._initialize_layer(5, 4, 7, weights=[2/3, 1/3])  # F
-            self._initialize_layer(6, 4, 7, weights=[1/3, 2/3])  # G
-            self.current_num_layers = 12
-            self.value_embeds.num_active_encoder_layers = 6
-
-    def _initialize_layer(self, new_idx, left_idx, right_idx, weights):
-        # Initialize block parameters
-        for name, param in self.blocks[new_idx].named_parameters():
-            left_param = self.blocks[left_idx].get_parameter(name)
-            right_param = self.blocks[right_idx].get_parameter(name)
-            param.data = weights[0] * left_param.data + weights[1] * right_param.data
-            param.requires_grad = True
-
-        # Initialize value embedding parameters (only for encoder layers)
-        if new_idx < self.current_num_layers // 2:
-            embed_idx = new_idx
-            left_embed_idx = left_idx if left_idx < self.current_num_layers // 2 else (
-                        self.current_num_layers - 1 - left_idx)
-            right_embed_idx = right_idx if right_idx < self.current_num_layers // 2 else (
-                        self.current_num_layers - 1 - right_idx)
-
-            for name, param in self.value_embeds.embed[embed_idx].named_parameters():
-                left_param = self.value_embeds.embed[left_embed_idx].get_parameter(name)
-                right_param = self.value_embeds.embed[right_embed_idx].get_parameter(name)
-                param.data = weights[0] * left_param.data + weights[1] * right_param.data
-                param.requires_grad = True
-
-        # Activate corresponding skip connection
-        if new_idx < self.current_num_layers // 2:  # Only for encoder layers
-            self.skip_weights[new_idx].requires_grad = True
+        self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(
-            self,
-            inputs: torch.Tensor,
-            targets: torch.Tensor,
-            sliding_window_num_blocks: torch.Tensor,
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        sliding_window_num_blocks: torch.Tensor,
     ):
         BLOCK_SIZE = 128
         seq_len = len(inputs)
@@ -387,62 +312,55 @@ class GPT(nn.Module):
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         def create_doc_swc_block_mask(sliding_window_num_blocks: torch.Tensor):
-            cache_idx = seq_len * sliding_window_num_blocks
-            if (self.cached_block_mask is None or cache_idx != self.cached_sliding_window):
-                kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
-                q_idx = block_idx[:, None]
-                causal_bm = q_idx >= kv_idx
-                causal_full_bm = q_idx > kv_idx
-                window_bm = q_idx - kv_idx < sliding_window_num_blocks
-                window_full_bm = window_bm
-                # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
-                document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
-                document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
-                nonzero_bm = causal_bm & window_bm & document_bm
-                full_bm = causal_full_bm & window_full_bm & document_full_bm
-                kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm ^ full_bm)
-                full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
-                self.cached_block_mask = BlockMask.from_kv_blocks(
-                    kv_num_blocks,
-                    kv_indices,
-                    full_kv_num_blocks,
-                    full_kv_indices,
-                    BLOCK_SIZE=BLOCK_SIZE,
-                    mask_mod=document_causal,
-                )
-                self.cached_sliding_window = cache_idx
-            return self.cached_block_mask
+            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
+            q_idx = block_idx[:, None]
+            causal_bm = q_idx >= kv_idx
+            causal_full_bm = q_idx > kv_idx
+            window_bm = q_idx - kv_idx < sliding_window_num_blocks
+            window_full_bm = window_bm
+            # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
+            document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
+            document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
+            nonzero_bm = causal_bm & window_bm & document_bm
+            full_bm  = causal_full_bm & window_full_bm & document_full_bm
+            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm ^ full_bm)
+            full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
+            return BlockMask.from_kv_blocks(
+                kv_num_blocks,
+                kv_indices,
+                full_kv_num_blocks,
+                full_kv_indices,
+                BLOCK_SIZE=BLOCK_SIZE,
+                mask_mod=document_causal,
+            )
 
         block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
         # forward the GPT model itself
-        x = self.embed(inputs[None])  # token embeddings of shape (b, t, model_dim)
-        x = norm(x)  # @Grad62304977
+        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        x = norm(x) # @Grad62304977
         x0 = x
-        ve = self.value_embeds(inputs)  # This now returns the correct list of value embeddings
+        ve = self.value_embeds(inputs)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
-        num_encoder_layers = self.current_num_layers // 2
+        # Store outputs for U-Net skip connections
         skip_connections = []
-
-        # Encoder pass
-        for i in range(num_encoder_layers):
-            x = self.blocks[i](x, ve[i], x0, block_mask)
+        # Encoder pass - process only the first half of the blocks
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, ve_enc[i], x0, block_mask)
             skip_connections.append(x)
-
-        # Decoder pass
-        for i in range(num_encoder_layers):
-            x = x + self.skip_weights[num_encoder_layers - 1 - i] * skip_connections.pop()
-            ve_idx = self.current_num_layers - 1 - i
-            block_idx = self.target_num_layers - 1 - i
-            x = self.blocks[block_idx](x, ve[ve_idx], x0, block_mask)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            # U-net structure on token value embeddings by @leloykun
+            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
 
         x = norm(x)
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30)
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return loss
-
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -453,8 +371,7 @@ def _peek_data_shard(file: Path):
     header = torch.from_file(f"{file}", False, 256, dtype=torch.int32)
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
-    return int(header[2])  # number of tokens (claimed)
-
+    return int(header[2]) # number of tokens (claimed)
 
 def _load_data_shard(path: Path, num_tokens):
     with path.open("rb", buffering=0) as f:
@@ -463,7 +380,6 @@ def _load_data_shard(path: Path, num_tokens):
         nbytes = f.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
     return tokens
-
 
 class DistributedDataLoader:
     def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
@@ -486,18 +402,18 @@ class DistributedDataLoader:
         self.current_shard = -1
         self.advance()
 
-    def advance(self):  # advance to next data shard
+    def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.seq_len
         self.tokens = _load_data_shard(self.files[self.current_shard], self.files_num_tokens[self.current_shard])
 
     def next_batch(self):
         batch_size = self.seq_len * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position + self.seq_len + 1]
+        buf = self.tokens[self.current_position:self.current_position+self.seq_len+1]
         # host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)  # inputs
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)  # targets
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
         # advance current position and load next shard if necessary
         self.current_position += batch_size
         if self.current_position + batch_size + 1 >= len(self.tokens):
@@ -514,19 +430,16 @@ class Hyperparameters:
     input_bin: str = 'data/fineweb10B/fineweb_train_*.bin'  # input .bin to train on
     input_val_bin: str = 'data/fineweb10B/fineweb_val_*.bin'  # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size: int = 20  # batch size, in sequences, across all devices
+    batch_size: int = 8  # batch size, in sequences, across all devices
     sequence_length: int = 10 * 1024  # sequence length, in tokens
     num_iterations: int = 1490  # number of iterations to run
     warmup_iters: int = 0
     cooldown_iters: int = 600  # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay: float = 0
     # evaluation and logging hyperparams
-    val_loss_every: int = 300 #150  # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens: int = 1638400*6  #1638400 #3112960 #10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_loss_every: int = 1500 #150  # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens: int = 1638400*7  #1638400 #3112960 #10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every: int = 0  # every how many steps to save the checkpoint? 0 for only at the end
-    first_growth_step: int = 110  # step to grow from 6 to 8 layers
-    second_growth_step: int = 305  # step to grow from 8 to 10 layers
-    third_growth_step: int = 620  # step to grow from 10 to 12 layers
 
 
 args = Hyperparameters()
@@ -601,18 +514,18 @@ def get_lr(it):
 
 
 best_score = -float("inf")
-target_loss = 4.14
+target_loss = 3.925
 val_loss_every = args.val_loss_every
-def objective(first_growth_step, second_growth_step, third_growth_step):
-    global best_score, val_loss_every
-    args.first_growth_step = int(round(first_growth_step))
+dry_run = True
+def objective(second_growth_step, third_growth_step):
+    global best_score, val_loss_every, dry_run
     args.second_growth_step = int(round(second_growth_step))
     args.third_growth_step = int(round(third_growth_step))
+
     args.val_loss_every = val_loss_every
     best_val_loss = float('inf')
     best_step = 0
-    approx_time = float("inf")
-    print(f"\n\n!!!!!!\nTESTING:{args.first_growth_step}, {args.second_growth_step}, {args.third_growth_step}\n!!!!!!\n\n")
+    print(f"\n\n!!!!!!\nTESTING:{args.second_growth_step}, {args.third_growth_step}\n!!!!!!\n\n")
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
@@ -635,8 +548,7 @@ def objective(first_growth_step, second_growth_step, third_growth_step):
     config.coordinate_descent_tuning = True  # suggested by @Chillee
     model = torch.compile(model)
     # here we wrap model into DDP container
-    model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True,
-                find_unused_parameters=True)
+    model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
     raw_model = model.module  # always contains the "raw" unwrapped model
 
     # init the optimizer(s)
@@ -645,7 +557,7 @@ def objective(first_growth_step, second_growth_step, third_growth_step):
     optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
     params = list(raw_model.blocks.parameters())
     matrix_params = [p for p in params if p.ndim == 2]
-    scalar_params = [p for p in params if p.ndim < 2] + list(raw_model.skip_weights)
+    scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
     optimizer3 = torch.optim.AdamW(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True, weight_decay=0.025)
     optimizer4 = Muon(matrix_params, lr=0.05, momentum=0.95)
     optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
@@ -678,10 +590,15 @@ def objective(first_growth_step, second_growth_step, third_growth_step):
             sw_num_blocks_prev = sw_num_blocks
 
         # once in a while evaluate the validation dataset
-        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0) or step in [1250]):
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
+            if dry_run and step == 350:
+                dry_run = False
+                print("Quitting dry run.")
+                return -999999
+
             # run validation batches
             model.eval()
             val_loader.reset()
@@ -695,11 +612,13 @@ def objective(first_growth_step, second_growth_step, third_growth_step):
             #if val_loss < best_val_loss:
             best_val_loss = val_loss.item()
             best_step = step
-            if val_loss < target_loss:
-                break
             # log val loss to console and to logfile
             print0(
                 f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / (timed_steps - 1):.2f}ms')
+            if val_loss < target_loss and step >= 1200:
+                break
+            if math.isnan(val_loss):
+                return -999999
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -743,8 +662,8 @@ def objective(first_growth_step, second_growth_step, third_growth_step):
             frac = min(step / 300, 1)
             for group in optimizer4.param_groups:
                 group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-        if step == (args.num_iterations - (args.cooldown_iters // 2)):
-            args.val_loss_every //= 30
+        if step == 1250:
+            args.val_loss_every = 8
         # step the optimizers and schedulers
         for opt, sched in zip(optimizers, schedulers):
             opt.step()
@@ -754,34 +673,35 @@ def objective(first_growth_step, second_growth_step, third_growth_step):
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+        # for sweep, when we let it reach the end
+        training_time_ms = approx_time
         print0(
             f"step:{step + 1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time / timed_steps:.2f}ms")
 
-    score = -training_time_ms - (best_val_loss * 30.0) if best_val_loss <= target_loss else -float("inf")
+    score = -training_time_ms - (best_step * 3.0) - (best_val_loss * 400.0) if best_val_loss <= target_loss else -999999
     print(f"\n\n!!!!!!\nSCORE:{score}\n!!!!!!\n\n")
     if score > best_score:
         best_score = score
-        update_best_params(args.first_growth_step, args.second_growth_step, args.third_growth_step, best_step, best_val_loss, training_time_ms)
+        update_best_params(args.second_growth_step, args.third_growth_step, best_step, best_val_loss, training_time_ms, score)
     return score
 
 
-def update_best_params(first_growth_step, second_growth_step, third_growth_step, step, val_loss, training_time_ms):
+def update_best_params(second_growth_step, third_growth_step, step, val_loss, training_time_ms, score):
     with open('best_params.json', 'a') as f:
         json.dump({
-            'first_growth_step': first_growth_step,
             'second_growth_step': second_growth_step,
             'third_growth_step': third_growth_step,
             'step': step,
             'val_loss': val_loss,
-            'training_time_ms': training_time_ms
+            'training_time_ms': training_time_ms,
+            'score': score,
         }, f)
         f.write('\n')
 
 # Bayesian Optimization
 pbounds = {
-    'first_growth_step': (85, 160),
-    'second_growth_step': (270, 375),
-    'third_growth_step': (530, 800)
+    'second_growth_step': (450, 650),
+    'third_growth_step': (850, 1120)
 }
 
 optimizer = BayesianOptimization(
@@ -789,9 +709,12 @@ optimizer = BayesianOptimization(
     pbounds=pbounds,
     random_state=42,
 )
+# Dry run for timing (big ouch but necessary)
+objective(args.second_growth_step, args.third_growth_step)
+best_score = -float("inf")
 optimizer.maximize(
-    init_points=7,
-    n_iter=21,
+    init_points=5,
+    n_iter=35,
 )
 
 print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
