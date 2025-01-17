@@ -1,6 +1,5 @@
 import os
 import sys
-
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
 import uuid
@@ -8,7 +7,6 @@ import time
 import contextlib
 from dataclasses import dataclass
 from pathlib import Path
-
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -16,6 +14,8 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.attention.flex_attention import BlockMask, flex_attention  # KoszarskyB
+import random
+import numpy as np
 
 
 # -----------------------------------------------------------------------------
@@ -180,7 +180,6 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x)
 
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, dim, num_heads):
         super().__init__()
         assert dim % num_heads == 0
@@ -189,138 +188,318 @@ class CausalSelfAttention(nn.Module):
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
+        self.rotary = Rotary(dim // num_heads)
         self.c_proj = CastedLinear(dim, dim)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_proj.weight.data.zero_()
 
-    def forward(self, x, vi, block_mask):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
+    def forward(self, x, ve, block_mask):
+        B, T = x.size(0), x.size(1)
+        assert B == 1, 'Must use batch size = 1 for FlexAttention'
         q = self.c_q(x).view(B, T, self.num_heads, -1)
         k = self.c_k(x).view(B, T, self.num_heads, -1)
         v = self.c_v(x).view(B, T, self.num_heads, -1)
-        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v)
+        else:
+            v = self.lambdas[0] * v
+
+        q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
-        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+
+        y = flex_attention(q.transpose(1, 2),
+                           k.transpose(1, 2),
+                           v.transpose(1, 2),
+                           block_mask=block_mask)
+        y = y.transpose(1, 2).contiguous().view_as(x)
         y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
-
     def __init__(self, dim):
         super().__init__()
-        self.c_fc   = CastedLinear(dim, 4 * dim)
+        self.c_fc = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_proj.weight.data.zero_()
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
-class Block(nn.Module):
-
-    def __init__(self, config: "GPTConfig", layer_idx: int):
+class FixedBlock(nn.Module):
+    """
+    Used for the first X blocks (the "input region") and last Y blocks (the "output region").
+    May apply value embeddings (ve) and can be integrated into skip connections.
+    """
+    def __init__(self, model_dim, num_heads, use_attn=True):
         super().__init__()
-        self.skip_attn_idx = config.num_layers // 2 + 1
-        if layer_idx != self.skip_attn_idx:
-            self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
-        self.mlp = MLP(config.model_dim)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
-        self.layer_idx = layer_idx
+        self.use_attn = use_attn
+        self.attn = CausalSelfAttention(model_dim, num_heads) if use_attn else None
+        self.mlp = MLP(model_dim)
 
-    def forward(self, x, vi, x0, block_mask):
+        # We keep this for possible skip weighting. If you do not want these
+        # extra parameters, you could remove them; but this keeps parity with
+        # the old design that had self.lambdas.
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x, ve, x0, block_mask):
+        # minimal approach, adopting the old code's "lambdas" usage
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        if self.layer_idx != self.skip_attn_idx:
-            x = x + self.attn(norm(x), vi, block_mask)
+
+        if self.use_attn:
+            x = x + self.attn(norm(x), ve, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
-class ValueEmbedding(nn.Module):
-    def __init__(self, config: "GPTConfig"):
+
+import math
+import torch.nn.functional as F
+from torch import nn
+
+class Router(nn.Module):
+    """
+    The Router class governs how each middle block decides which block to visit next, effectively enabling dynamic sequencing in the model’s middle region.
+    At a high level, each middle block has 𝑀+1 possible routes: indices 0 to 𝑀-1 for the other middle blocks, plus index 𝑀 for an “exit route” that leads to the output blocks.
+    To encourage a natural left-to-right progression, each block is assigned a “forward route,” typically the block with index current_block_idx+1, unless we are at the last middle block, in which case the “forward route” is the exit (𝑀).
+    At initialization, the router sets a higher probability on that forward route, so the “default” path traverses the middle blocks in ascending order and finally exits.
+    During training, the router’s logit parameters update to reflect learned routes—some blocks may skip forward or route to earlier blocks if that proves more optimal.
+
+    In operation, each middle block receives two special numerical features—block_pass_count (how many times we have visited a middle block so far) and max_block_count (the maximum allowed visits)—which are concatenated to a summary of the block’s token representations.
+    This combined input is passed through a Gumbel-Softmax layer to produce a distribution over all possible next routes.
+    If training, the code may print out statements like “Routing from 0 to 1” or “Routing from 9 to M (10), exiting to output” or "Max block count reached, routing from 4 to M (10) instead of 5" depending on which path is chosen at each step.
+    Early in training, we expect the router to follow its initialization bias, mostly stepping block-by-block through the middle region;
+    over time, as the model learns, the router might diverge from this simple route—skipping blocks, revisiting earlier blocks, or exiting earlier—if that yields better performance.
+    """
+    def __init__(self, model_dim, M, gumbel_temp, initial_forward_prob, this_block_idx):
         super().__init__()
-        self.embed = nn.ModuleList([
-            nn.Embedding(config.vocab_size, config.model_dim)
-            for _ in range(6)
+        self.M = M
+        self.gumbel_temp = gumbel_temp
+        self.this_block_idx = this_block_idx
+
+        # We'll produce logits from a vector in R^(model_dim+2):
+        #    x_mean (size model_dim) + [block_pass_count, max_block_count]
+        self.weight = nn.Parameter(torch.zeros(M+1, model_dim+2))
+        self.bias = nn.Parameter(torch.zeros(M+1))
+
+        # Initialize weight with small random normal distribution
+        nn.init.normal_(self.weight, mean=0.0, std=1e-3)
+
+        # The route that is "forward" from this_block_idx is:
+        # if i < M-1 => next block = i+1
+        # if i == M-1 => exit (index = M)
+        self.forward_route_idx = min(self.this_block_idx + 1, M)
+
+        # Bias the router so that self.forward_route_idx has initial_forward_prob
+        # and all other routes share the remainder evenly.
+        forward_bias = math.log(initial_forward_prob)
+
+        # There are M+1 total routes, so we distribute (1 - initial_forward_prob)
+        # among the other M routes. But one of them is also exit route = M.
+        # We do not exclude "self route" or anything; it's a design choice whether
+        # block i can route to i, or skip multiple blocks, etc.
+        # For simplicity, we just treat them all as "other routes" here.
+        remain_count = (M+1) - 1  # excluding the forward_route
+        if remain_count > 0:
+            remain_prob = (1.0 - initial_forward_prob) / remain_count
+        else:
+            remain_prob = 0.0  # edge case if M=0
+        other_bias = math.log(remain_prob) if remain_prob > 0 else -1e8  # so we don't get NaNs
+
+        with torch.no_grad():
+            for i in range(M+1):
+                if i == self.forward_route_idx:
+                    self.bias[i] = forward_bias
+                else:
+                    self.bias[i] = other_bias
+
+    def forward(self, x, block_pass_count, max_block_count):
+        """
+        x: shape (B=1, T, D)
+        We will take the mean across T to get x_mean in (B=1, D).
+        Then we concat [block_pass_count, max_block_count] as two extra features.
+        """
+        # 1) mean over the time dimension
+        x_mean = x.mean(dim=1)  # shape = (1, D)
+
+        # 2) create a (1, 2) tensor for [block_pass_count, max_block_count]
+        bc_info = torch.tensor(
+            [float(block_pass_count), float(max_block_count)],
+            dtype=x_mean.dtype,
+            device=x_mean.device
+        ).unsqueeze(0)  # shape = (1, 2)
+
+        # 3) concat => shape (1, D+2)
+        x_cat = torch.cat([x_mean, bc_info], dim=-1)
+
+        # 4) compute logits => shape (1, M+1)
+        logits = F.linear(x_cat, self.weight, self.bias)
+
+        # Gumbel-Softmax distribution. We'll keep it soft but pick argmax for the next route.
+        # This allows the gradient to flow, and leaves us open to explore MCTS or other path search.
+        route_prob = F.gumbel_softmax(logits, tau=self.gumbel_temp, hard=False)
+        return route_prob
+
+
+class MiddleBlock(nn.Module):
+    def __init__(self, model_dim, num_heads, M, gumbel_temp, initial_forward_prob, this_block_idx):
+        super().__init__()
+        self.this_block_idx = this_block_idx
+        self.attn = CausalSelfAttention(model_dim, num_heads)
+        self.mlp = MLP(model_dim)
+
+        # Pass the block index into the Router so it knows which route
+        # is the "forward" route for this specific block.
+        self.router = Router(
+            model_dim=model_dim,
+            M=M,
+            gumbel_temp=gumbel_temp,
+            initial_forward_prob=initial_forward_prob,
+            this_block_idx=this_block_idx
+        )
+
+    def forward(self, x, block_mask, block_pass_count, max_block_count):
+        # Standard middle-block processing (no VE usage):
+        x = x + self.attn(norm(x), None, block_mask)
+        x = x + self.mlp(norm(x))
+
+        # Now get the routing distribution:
+        route_prob = self.router(x, block_pass_count, max_block_count)
+        return x, route_prob
+
+class ValueEmbedding(nn.Module):
+    """
+    Constructor receives X and M.  We create X embedding modules, and in forward()
+    produce a list of length X+M+X: [ X embeddings, M None, X embeddings ].
+    """
+    def __init__(self, vocab_size: int, model_dim: int, X: int, M: int):
+        super().__init__()
+        self.X = X
+        self.M = M
+        self.embed_list = nn.ModuleList([
+            nn.Embedding(vocab_size, model_dim) for _ in range(X)
         ])
 
-    def forward(self, inputs) -> "list[torch.Tensor]":
-        ve = [emb(inputs) for emb in self.embed]
-        ve += reversed(ve)
+    def forward(self, inputs):
+        # Generate one embedding output per input-block embedding
+        emb_outs = [emb(inputs).bfloat16() for emb in self.embed_list]  # length X
+        # Insert M None entries in the middle, then re-append the same X embeddings
+        ve = emb_outs + [None] * self.M + emb_outs
         return ve
 
-# -----------------------------------------------------------------------------
-# The main GPT-2 model
-
-@dataclass
-class GPTConfig:
-    vocab_size : int = 50304
-    num_layers : int = 12
-    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
-    model_dim : int = 768
 
 class GPT(nn.Module):
-
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.num_layers = config.num_layers
-
-        # U-net design by @brendanh0gan
-        self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
-        self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
-        # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
-
-        self.embed = nn.Embedding(config.vocab_size, config.model_dim)
-        self.blocks = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.num_layers)])
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
-        # U-net structure on token value embeddings by @leloykun
-        self.value_embeds = ValueEmbedding(config)
-        self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
-        self.lm_head.weight.data.zero_() # @Grad62304977
-
-    def forward(
+    def __init__(
         self,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        sliding_window_num_blocks: torch.Tensor,
+        vocab_size: int,
+        X=1,
+        M=10,
+        Y=1,
+        num_heads=8,
+        model_dim=768,
+        gumbel_temp=1.0,
+        alpha=0.5,
+        initial_forward_prob=0.95,
     ):
+        """
+        GPT with:
+          - X fixed input blocks
+          - M middle blocks (unordered)
+          - Y fixed output blocks
+          - We require X == Y
+        """
+        super().__init__()
+        assert X == Y, "We require X == Y for matching input/output block pattern"
+        self.X = X
+        self.M = M
+        self.Y = Y
+        self.gumbel_temp = gumbel_temp
+        self.alpha = alpha
+        self.initial_forward_prob = initial_forward_prob
+
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, X=X, M=M)
+
+        # Build the input blocks
+        self.input_blocks = nn.ModuleList([
+            FixedBlock(model_dim, num_heads, use_attn=True)
+            for _ in range(X)
+        ])
+
+        # Build the M middle blocks, each with a router
+        self.middle_blocks = nn.ModuleList([
+            MiddleBlock(
+                model_dim=model_dim,
+                num_heads=num_heads,
+                M=M,
+                gumbel_temp=self.gumbel_temp,
+                initial_forward_prob=self.initial_forward_prob,
+                this_block_idx=i
+            )
+            for i in range(M)
+        ])
+
+        # Build the output blocks
+        self.output_blocks = nn.ModuleList([
+            FixedBlock(model_dim, num_heads, use_attn=True)
+            for _ in range(Y)
+        ])
+
+        # Final language modeling head
+        self.lm_head = CastedLinear(model_dim, vocab_size)
+        self.lm_head.weight.data.zero_()
+
+        # For a U-Net-like skip from X => Y blocks:
+        # We'll store skip outputs after each input block, then re-add them in output blocks.
+        # We'll give each output block a skip weight.
+        self.skip_weights = nn.Parameter(torch.ones(Y))
+
+    def forward(self, inputs, targets, sliding_window_num_blocks, max_block_count=10):
+        """
+        inputs: shape (T,) of token IDs (must be 1D).
+        targets: shape (T,) of token IDs (same length).
+        sliding_window_num_blocks: for block_mask creation
+        max_block_count: the maximum number of times to loop in the middle region
+        """
         BLOCK_SIZE = 128
         seq_len = len(inputs)
         assert seq_len % BLOCK_SIZE == 0
-        total_num_blocks = seq_len // BLOCK_SIZE
         assert inputs.ndim == 1
-        docs = (inputs == 50256).cumsum(0)
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
 
+        total_num_blocks = seq_len // BLOCK_SIZE
+        docs = (inputs == 50256).cumsum(0)  # same doc-splitting logic
+
+        # We create the doc_swc block mask as in the original
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
 
-        def dense_to_ordered(dense_mask: torch.Tensor):
+        def dense_to_ordered(dense_mask):
             num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
             indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
-        def create_doc_swc_block_mask(sliding_window_num_blocks: torch.Tensor):
-            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
+        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+
+        def create_doc_swc_block_mask(sliding_window_num_blocks):
+            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device='cuda')
             q_idx = block_idx[:, None]
             causal_bm = q_idx >= kv_idx
             causal_full_bm = q_idx > kv_idx
-            window_bm = q_idx - kv_idx < sliding_window_num_blocks
+            window_bm = (q_idx - kv_idx) < sliding_window_num_blocks
             window_full_bm = window_bm
-            # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
             document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
             document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
+
             nonzero_bm = causal_bm & window_bm & document_bm
-            full_bm  = causal_full_bm & window_full_bm & document_full_bm
-            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm ^ full_bm)
+            full_bm = causal_full_bm & window_full_bm & document_full_bm
+
+            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm & ~full_bm)
             full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
+
             return BlockMask.from_kv_blocks(
                 kv_num_blocks,
                 kv_indices,
@@ -332,31 +511,69 @@ class GPT(nn.Module):
 
         block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
-        # forward the GPT model itself
-        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
-        x = norm(x) # @Grad62304977
-        x0 = x
-        ve = self.value_embeds(inputs)
-        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+        # embed input tokens
+        x0 = norm(self.embed(inputs[None]).bfloat16())  # shape (1, T, D)
+        x = x0
 
-        # Store outputs for U-Net skip connections
+        # get the value embeddings (which is a list of 12 segments, but we only need X + Y)
+        ve_all = self.value_embeds(inputs)  # length 12
+        # We'll slice out the first X for the input blocks and the last Y for the output blocks
+        # The middle blocks do not use any ve.
+        ve_input = ve_all[: self.X]
+        ve_output = ve_all[-self.Y :] if self.Y > 0 else []
+
+        # 1) input (X) pass
         skip_connections = []
-        # Encoder pass - process only the first half of the blocks
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0, block_mask)
+        for i in range(self.X):
+            x = self.input_blocks[i](x, ve_input[i], x0, block_mask)
+            # store skip
             skip_connections.append(x)
-        # Decoder pass - process the remaining blocks with weighted skip connections
-        for i in range(self.num_decoder_layers):
-            x = x + self.skip_weights[i] * skip_connections.pop()
-            # U-net structure on token value embeddings by @leloykun
-            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
 
+        # 2) dynamic middle pass
+        current_idx = 0
+        block_pass_count = 0
+
+        # We have M middle blocks; the router picks among 0..(M-1) or M => exit
+        while block_pass_count < max_block_count:
+            # pass x through the current middle block
+            x, route_prob = self.middle_blocks[current_idx](x, block_mask, block_pass_count, max_block_count)
+            # route_prob: shape (1, M+1)
+            next_idx = route_prob.argmax(dim=-1)[0]  # pick the route with highest prob
+            if bool(next_idx.eq(self.M)):
+                print(f"Routing from {current_idx} to M ({self.M}), exiting to output")
+                # means route to output region
+                break
+            if (block_pass_count+1) >= max_block_count:
+                print(f"Max block count reached, routing from {current_idx} to M ({self.M}) instead of {int(next_idx)}")
+            else:
+                print(f"Routing from {current_idx} to {int(next_idx)}")
+            current_idx = int(next_idx)
+            block_pass_count += 1
+
+
+        # 3) output (Y) pass
+        # For a U-Net style, we re-add skip from the input blocks
+        for j in range(self.Y):
+            x = x + self.skip_weights[j] * skip_connections.pop()
+            x = self.output_blocks[j](x, ve_output[j], x0, block_mask)
+
+        # finalize
         x = norm(x)
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        # soft cap
+        logits = 15 * torch.tanh(logits / 15)
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        # compute cross-entropy
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets)
+
+        # add usage penalty for the middle region
+        if self.training:
+            usage_penalty = self.alpha * (block_pass_count / float(self.M if self.M > 0 else 1))
+            loss = loss + usage_penalty
+
         return loss
+
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -432,10 +649,18 @@ class Hyperparameters:
     warmup_iters: int = 0
     cooldown_iters: int = 600  # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay: float = 0
+    # Unordered Blocks
+    X: int = 1
+    M: int = 10
+    Y: int = 1
+    gumbel_temp: float = 1.0
+    route_count_alpha: float = 0.5
+    initial_forward_prob: float = 0.95
     # evaluation and logging hyperparams
-    val_loss_every: int = 300  # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens: int = 1638400*7 #1638400 #3112960 #10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_loss_every: int = 0  # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens: int = 1638400*7 #1638400*7 #3112960*4 #10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every: int = 0  # every how many steps to save the checkpoint? 0 for only at the end
+    fixed_seed: int = 1337  # None to disable
 
 
 args = Hyperparameters()
@@ -451,6 +676,41 @@ print(f'using device: {device}')
 dist.init_process_group(backend='nccl', device_id=device)
 dist.barrier()
 master_process = (ddp_rank == 0)  # this process will do logging, checkpointing etc.
+
+
+def set_global_seed(seed: int):
+    # Have rank 0 create a fresh random seed
+    if ddp_rank == 0:
+        # rank 0 is the "root" - broadcast to everyone
+        seeder = torch.tensor([seed], device='cuda', dtype=torch.long)
+    else:
+        seeder = torch.zeros((1,), device='cuda', dtype=torch.long)
+    # Make sure everyone has reached this point
+    dist.barrier()
+    # Broadcast that seed to all ranks
+    dist.broadcast(seeder, src=0)
+
+    # Python and NumPy
+    random.seed(seed + ddp_rank)
+    np.random.seed(seed + ddp_rank)
+
+    # PyTorch
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    torch.manual_seed(seed + ddp_rank)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed + ddp_rank)
+        torch.cuda.manual_seed_all(seed + ddp_rank)
+        # Make cuDNN determinstic
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # Another barrier so that all processes finish seeding before continuing
+    dist.barrier()
+if args.fixed_seed is not None:
+    set_global_seed(args.fixed_seed)
+
 
 # begin logging
 logfile = None
@@ -506,7 +766,17 @@ inputs_train, targets_train = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
+model = GPT(
+    vocab_size=50304,
+    X=args.X,
+    M=args.M,
+    Y=args.Y,
+    num_heads=6,
+    model_dim=768,
+    gumbel_temp=args.gumbel_temp,
+    alpha=args.route_count_alpha,
+    initial_forward_prob=args.initial_forward_prob,
+)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -514,19 +784,39 @@ for m in model.modules():
 config.coordinate_descent_tuning = True  # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True, find_unused_parameters=True)
 raw_model = model.module  # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
-optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.blocks.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = torch.optim.AdamW(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True, weight_decay=0.025)
-optimizer4 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+hidden_matrix_params = []
+for blk in raw_model.input_blocks:
+    hidden_matrix_params.extend(p for p in blk.parameters() if p.ndim == 2)
+for blk in raw_model.middle_blocks:
+    hidden_matrix_params.extend(p for p in blk.parameters() if p.ndim == 2)
+for blk in raw_model.output_blocks:
+    hidden_matrix_params.extend(p for p in blk.parameters() if p.ndim == 2)
+
+# embed_params = the main embedding plus value embeds
+embed_params = [raw_model.embed.weight, *raw_model.value_embeds.parameters()]
+# LM head params
+head_params = [raw_model.lm_head.weight]
+# scalar_params = everything else that is < 2D
+scalar_params = [
+    p for p in raw_model.parameters()
+    if p.ndim < 2
+]
+# Define the two-optimizer scheme:
+optimizer1 = torch.optim.Adam(
+    [
+        dict(params=embed_params, lr=0.6),
+        dict(params=head_params, lr=0.008),
+        dict(params=scalar_params, lr=0.04),
+    ],
+    betas=(0.8, 0.95),
+    fused=True
+)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)
+optimizers = [optimizer1, optimizer2]
 
 
 # learning rate decay scheduler (linear warmup and cooldown)
@@ -572,7 +862,7 @@ for step in range(args.num_iterations + 1):
         sw_num_blocks_prev = sw_num_blocks
 
     # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0) or step in [1000]):
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0) or step in []):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -583,7 +873,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 inputs_val, targets_val = val_loader.next_batch()
-                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
+                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks, step, mode="val")
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -598,9 +888,9 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(),
-                   optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        #log = dict(step=step, code=code, model=raw_model.state_dict(),
+        #           optimizers=[opt.state_dict() for opt in optimizers])
+        #torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -618,10 +908,10 @@ for step in range(args.num_iterations + 1):
         with contextlib.ExitStack() as stack:
             if i < train_accumulation_steps:  # there's no need to sync gradients every accumulation step
                 stack.enter_context(model.no_sync())
-            # Layer step-up causes recompilations, so we have to disable this optimization
+            # This doesn't work with token-weighted loss (or needs to be set > args.token_loss_warmup_iters?)
             #if step >= 5:
             #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-            model(inputs_train, targets_train, sliding_window_num_blocks).backward()
+            model(inputs_train, targets_train, sliding_window_num_blocks, step).backward()
             inputs_train, targets_train = train_loader.next_batch()
     if train_accumulation_steps != 1:
         for p in model.parameters():
@@ -630,7 +920,7 @@ for step in range(args.num_iterations + 1):
     if step < 301:
         # momentum warmup for Muon
         frac = min(step / 300, 1)
-        for group in optimizer4.param_groups:
+        for group in optimizer2.param_groups:
             group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     #if step == (args.num_iterations - (args.cooldown_iters // 2)):
     #    args.val_loss_every = 15

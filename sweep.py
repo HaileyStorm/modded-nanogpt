@@ -20,6 +20,8 @@ from bayes_opt import BayesianOptimization
 from bayes_opt.event import DEFAULT_EVENTS, Events
 import json
 import math
+import random
+import numpy as np
 
 
 # -----------------------------------------------------------------------------
@@ -273,8 +275,8 @@ class GPT(nn.Module):
         self.num_layers = config.num_layers
 
         # U-net design by @brendanh0gan
-        self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
-        self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
+        self.num_encoder_layers = config.num_layers // 2  # Half of the layers for encoder
+        self.num_decoder_layers = config.num_layers - self.num_encoder_layers  # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
@@ -284,13 +286,190 @@ class GPT(nn.Module):
         # U-net structure on token value embeddings by @leloykun
         self.value_embeds = ValueEmbedding(config)
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
-        self.lm_head.weight.data.zero_() # @Grad62304977
+        self.lm_head.weight.data.zero_()  # @Grad62304977
+
+        # Initialize token loss tracking
+        self.register_buffer('token_loss_counts', torch.zeros(config.vocab_size))
+        self.register_buffer('token_loss_sums', torch.zeros(config.vocab_size))
+        self.register_buffer('token_loss_sum_squares', torch.zeros(config.vocab_size))
+        self.register_buffer('token_loss_avgs', torch.ones(config.vocab_size))
+        self.register_buffer('token_loss_stds', torch.zeros(config.vocab_size))
+        # Buffers for interval-based updates
+        self.register_buffer('interim_counts', torch.zeros(config.vocab_size))
+        self.register_buffer('interim_sums', torch.zeros(config.vocab_size))
+        self.register_buffer('interim_sum_squares', torch.zeros(config.vocab_size))
+        # Track recently touched tokens
+        self.recent_tokens = [set() for _ in range(args.recent_token_memory)]
+        self.current_interval_idx = 0
+
+    @torch._dynamo.disable()
+    @torch.no_grad()
+    def _gpu_accumulate_stats(self, losses, targets, step):
+        # Vectorized approach, all on GPU
+        flat_targets = targets.view(-1).long()
+        flat_losses = losses.view(-1).bfloat16()
+
+        unique_tokens, inverse_indices = flat_targets.unique(return_inverse=True)
+
+        counts = torch.zeros_like(unique_tokens, dtype=torch.bfloat16)
+        sums = torch.zeros_like(unique_tokens, dtype=torch.bfloat16)
+        sum_squares = torch.zeros_like(unique_tokens, dtype=torch.bfloat16)
+
+        ones_for_counts = torch.ones_like(flat_losses, dtype=torch.bfloat16)
+        counts.index_add_(0, inverse_indices, ones_for_counts)
+        sums.index_add_(0, inverse_indices, flat_losses)
+        sum_squares.index_add_(0, inverse_indices, flat_losses ** 2)
+
+        self.interim_counts.index_add_(0, unique_tokens, counts)
+        self.interim_sums.index_add_(0, unique_tokens, sums)
+        self.interim_sum_squares.index_add_(0, unique_tokens, sum_squares)
+
+        # --- Store these tokens into the current interval set ---
+        # Move to CPU so we can stuff them into a Python set
+        unique_tokens_cpu = unique_tokens.detach().cpu().tolist()
+        self.recent_tokens[self.current_interval_idx].update(unique_tokens_cpu)
+
+        # Every N steps, call _update_global_stats
+        if step % args.stats_update_interval == (args.stats_update_interval - 1):
+            self._update_global_stats()
+            # After stats update, advance to the NEXT buffer slot (ring buffer)
+            self.current_interval_idx = (self.current_interval_idx + 1) % args.recent_token_memory
+            # Clear that next slot, because we’re about to start writing into it
+            self.recent_tokens[self.current_interval_idx].clear()
+
+    @torch._dynamo.disable()
+    @torch.no_grad()
+    def _update_global_stats(self):
+        all_recent_tokens = set()
+        for rt in self.recent_tokens:
+            if rt is not None:
+                all_recent_tokens.update(rt)
+
+        if not all_recent_tokens:
+            return  # nothing to update
+
+        update_mask = torch.zeros_like(self.token_loss_counts, dtype=torch.bool)
+        update_mask[list(all_recent_tokens)] = True
+
+        # Update global counts
+        self.token_loss_counts[update_mask] += self.interim_counts[update_mask]
+        self.token_loss_sums[update_mask] += self.interim_sums[update_mask]
+        self.token_loss_sum_squares[update_mask] += self.interim_sum_squares[update_mask]
+
+        # Compute means and std
+        counts = self.token_loss_counts[update_mask]
+        means = self.token_loss_sums[update_mask] / counts.clamp(min=1)
+
+        variances = (self.token_loss_sum_squares[update_mask] / counts.clamp(min=1)) - (means ** 2)
+        stds = torch.sqrt(torch.clamp(variances, min=1e-6))
+
+        self.token_loss_avgs[update_mask] = means
+        self.token_loss_stds[update_mask] = stds
+
+        # Clear interim buffers
+        self.interim_counts.zero_()
+        self.interim_sums.zero_()
+        self.interim_sum_squares.zero_()
+
+    @torch._dynamo.disable()
+    @torch.no_grad()
+    def get_token_weights(self, targets, step):
+        """
+        Avoid any branch that changes shapes. Inductor sees a single path:
+          - If valid_mask has no True, we define global_mean=0, global_std=1 => weights=1
+          - If step < warmup => we set progress=0 => weights=1
+          - Otherwise => normal weighting
+        Everything is float32. Return shape == [# of tokens in the batch].
+        """
+        # 0) Flatten & ensure int64 for indexing, float32 for final
+        flat_targets = targets.view(-1).to(torch.int64)
+        device = flat_targets.device
+
+        # We'll build final_weights in float32
+        final_weights = torch.ones_like(flat_targets, dtype=torch.float32, device=device)
+
+        # 1) Compute progress factor in [0,1]
+        warmup = args.token_loss_warmup_iters
+        total_steps = args.num_iterations - warmup
+        if total_steps <= 0:
+            progress = 0.0
+        else:
+            step_after_warmup = max(0, step - warmup)
+            progress = float(min(max(step_after_warmup / total_steps, 0.0), 1.0))
+
+        # 2) Compute max/min weight in float32
+        max_weight = 1.0 + (args.token_loss_max_weight - 1.0) * progress
+        min_weight = 1.0 + (args.token_loss_min_weight - 1.0) * progress
+        max_weight_t = torch.tensor(max_weight, dtype=torch.float32, device=device)
+        min_weight_t = torch.tensor(min_weight, dtype=torch.float32, device=device)
+
+        # 3) Gather stats from global buffers
+        counts = self.token_loss_counts[flat_targets].float()  # shape [batch]
+        means = self.token_loss_avgs[flat_targets].float()  # shape [batch]
+
+        valid_counts = (self.token_loss_counts > 0).to(torch.int8)
+        has_valid = valid_counts.sum() > 0
+
+        global_mean = torch.where(
+            has_valid,
+            (self.token_loss_avgs * valid_counts.float()).sum() / (valid_counts.float().sum() + 1e-8),
+            torch.tensor(0.0, dtype=torch.float32, device=device)
+        )
+        global_std = torch.where(
+            has_valid,
+            (self.token_loss_stds * valid_counts.float()).sum() / (valid_counts.float().sum() + 1e-8),
+            torch.tensor(1.0, dtype=torch.float32, device=device)
+        )
+
+        # 4) Compute z-scores
+        z_scores = (means - global_mean) / (global_std + 1e-6)
+
+        # Base weighting from z-scores => in [-1, +1], scaled to [1, max_weight]
+        tanh_vals = torch.tanh(z_scores)  # in [-1, +1]
+        diff = max_weight_t - 1.0
+        raw_weights = 1.0 + tanh_vals * diff  # shape [batch]
+
+        # --- Apply new flags to clamp or disable certain directions ---
+        # if we're NOT up-weighting high-loss tokens => clamp any raw_weights > 1.0 down to 1.0
+        if not args.enable_high_loss_upweighting:
+            raw_weights = torch.minimum(raw_weights, torch.tensor(1.0, device=device))
+
+        # if we're NOT down-weighting low-loss tokens => clamp any raw_weights < 1.0 up to 1.0
+        if not args.enable_low_loss_downweighting:
+            raw_weights = torch.maximum(raw_weights, torch.tensor(1.0, device=device))
+
+        # if we *are* down-weighting low-loss tokens => enforce a minimum of token_loss_min_weight
+        if args.enable_low_loss_downweighting:
+            # Typically min_weight <= 1.0.  If user sets it above 1.0, it’s on them.
+            raw_weights = torch.clamp(raw_weights, min=min_weight_t.item(), max=9999.0)
+
+        # 5) Rare-token logic
+        rare_token_mask = (counts < args.min_token_samples)
+        sample_factor = (counts / args.min_token_samples).clamp_(0, 1)
+        rare_token_weights = 1.0 + args.rare_token_epsilon * sample_factor
+        final_weights.copy_(raw_weights)  # fill with raw_weights
+        final_weights[rare_token_mask] = rare_token_weights[rare_token_mask]
+
+        # 6) If progress=0 => we get raw_weights=1 => done
+
+        # 7) Normalize so mean=1 (only if non-empty)
+        target_mean = 1.0
+        if final_weights.numel() > 0:
+            mean_val = final_weights.mean()
+            scale_factor = target_mean / (mean_val + 1e-8)
+            # Don’t over-correct
+            scale_factor = torch.clamp(scale_factor, 0.5, 2.0)
+            final_weights *= scale_factor
+
+        return final_weights
 
     def forward(
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
         sliding_window_num_blocks: torch.Tensor,
+        step: int,
+        mode: str = 'train'
     ):
         BLOCK_SIZE = 128
         seq_len = len(inputs)
@@ -359,8 +538,19 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return loss
+
+        if mode == 'val':
+            # Return plain cross-entropy
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        # Calculate initial losses per token
+        losses = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
+        # GPU-based stats accumulation
+        self._gpu_accumulate_stats(losses.detach(), targets.detach(), step)
+        # Weighting
+        token_weights = self.get_token_weights(targets.detach(), step)
+        weighted_losses = losses * token_weights
+        return weighted_losses.mean()
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -431,15 +621,26 @@ class Hyperparameters:
     input_val_bin: str = 'data/fineweb10B/fineweb_val_*.bin'  # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size: int = 8  # batch size, in sequences, across all devices
-    sequence_length: int = 10 * 1024  # sequence length, in tokens
+    sequence_length: int = 19 * 1024  # sequence length, in tokens
     num_iterations: int = 1490  # number of iterations to run
-    warmup_iters: int = 0
+    warmup_iters: int = 100
     cooldown_iters: int = 600  # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay: float = 0
+    # Token loss weighting hyperparameters
+    token_loss_warmup_iters: int = 201  # Steps before starting to apply token-specific weighting
+    token_loss_max_weight: float = 1.014  # Maximum multiplier for high-loss tokens
+    token_loss_min_weight: float = 0.8726  # Minimum multiplier for low-loss tokens
+    min_token_samples: int = 10  # Minimum samples needed for full weighting
+    rare_token_epsilon: float = 0.1  # Max extra weight for rare tokens
+    stats_update_interval: int = 19  # How often to update token statistics
+    recent_token_memory: int = 9  # How many update intervals to keep track of touched tokens
+    enable_high_loss_upweighting: bool = True  # If True, tokens with mean > global_mean are up-weighted
+    enable_low_loss_downweighting: bool = False  # If True, tokens with mean < global_mean are down-weighted
     # evaluation and logging hyperparams
-    val_loss_every: int = 1500 #150  # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens: int = 1638400*7  #1638400 #3112960 #10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_loss_every: int = 0  # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens: int = 3112960*40 #1638400*7 #3112960*4 #10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every: int = 0  # every how many steps to save the checkpoint? 0 for only at the end
+    fixed_seed: int = 1337  # None to disable
 
 
 args = Hyperparameters()
@@ -455,6 +656,39 @@ print(f'using device: {device}')
 dist.init_process_group(backend='nccl', device_id=device)
 dist.barrier()
 master_process = (ddp_rank == 0)  # this process will do logging, checkpointing etc.
+
+
+def set_global_seed(seed: int):
+    # Have rank 0 create a fresh random seed
+    if ddp_rank == 0:
+        # rank 0 is the "root" - broadcast to everyone
+        seeder = torch.tensor([seed], device='cuda', dtype=torch.long)
+    else:
+        seeder = torch.zeros((1,), device='cuda', dtype=torch.long)
+    # Make sure everyone has reached this point
+    dist.barrier()
+    # Broadcast that seed to all ranks
+    dist.broadcast(seeder, src=0)
+
+    # Python and NumPy
+    random.seed(seed + ddp_rank)
+    np.random.seed(seed + ddp_rank)
+
+    # PyTorch
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    torch.manual_seed(seed + ddp_rank)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed + ddp_rank)
+        torch.cuda.manual_seed_all(seed + ddp_rank)
+        # Make cuDNN determinstic
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # Another barrier so that all processes finish seeding before continuing
+    dist.barrier()
+
 
 # begin logging
 logfile = None
@@ -515,17 +749,24 @@ def get_lr(it):
 
 best_score = -float("inf")
 target_loss = 3.925
-val_loss_every = args.val_loss_every
+val_loss_every = 0 #args.val_loss_every
 dry_run = True
-def objective(second_growth_step, third_growth_step):
+FIXED_SEED = 1337
+def objective(token_loss_max_weight, stats_update_interval, recent_token_memory):
     global best_score, val_loss_every, dry_run
-    args.second_growth_step = int(round(second_growth_step))
-    args.third_growth_step = int(round(third_growth_step))
+    args.token_loss_max_weight = round(token_loss_max_weight, 3)
+    args.stats_update_interval = int(round(stats_update_interval / 100.0))
+    args.recent_token_memory = int(round(recent_token_memory / 100.0))
+
+    set_global_seed(FIXED_SEED)
 
     args.val_loss_every = val_loss_every
     best_val_loss = float('inf')
     best_step = 0
-    print(f"\n\n!!!!!!\nTESTING:{args.second_growth_step}, {args.third_growth_step}\n!!!!!!\n\n")
+    if dry_run:
+        print("\n\n!!!!!!\nDRY RUN\n!!!!!!\n\n")
+    else:
+        print(f"\n\n!!!!!!\nTESTING:{args.token_loss_max_weight}, {args.stats_update_interval}, {args.recent_token_memory}\n!!!!!!\n\n")
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
@@ -589,15 +830,16 @@ def objective(second_growth_step, third_growth_step):
             sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
             sw_num_blocks_prev = sw_num_blocks
 
+        if dry_run and step == 350:
+            dry_run = False
+            print("Quitting dry run.")
+            return -999999
+
         # once in a while evaluate the validation dataset
-        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0) or step in [1250]):
+        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0) or step in []):
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
-            if dry_run and step == 350:
-                dry_run = False
-                print("Quitting dry run.")
-                return -999999
 
             # run validation batches
             model.eval()
@@ -606,7 +848,7 @@ def objective(second_growth_step, third_growth_step):
             for _ in range(val_steps):
                 with torch.no_grad():
                     inputs_val, targets_val = val_loader.next_batch()
-                    val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
+                    val_loss += model(inputs_val, targets_val, sliding_window_num_blocks, step, mode="val")
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss /= val_steps
             #if val_loss < best_val_loss:
@@ -615,22 +857,22 @@ def objective(second_growth_step, third_growth_step):
             # log val loss to console and to logfile
             print0(
                 f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / (timed_steps - 1):.2f}ms')
-            if val_loss < target_loss and step >= 1200:
-                break
-            if math.isnan(val_loss):
-                return -999999
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
+            # if val_loss < target_loss and step >= 1200:
+            #    break
+            if math.isnan(val_loss):
+                return -999999
 
         if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             # save the state of the training process
-            log = dict(step=step, code=code, model=raw_model.state_dict(),
-                       optimizers=[opt.state_dict() for opt in optimizers])
-            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+            #log = dict(step=step, code=code, model=raw_model.state_dict(),
+            #           optimizers=[opt.state_dict() for opt in optimizers])
+            #torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -651,7 +893,7 @@ def objective(second_growth_step, third_growth_step):
                 # Layer step-up causes recompilations, so we have to disable this optimization
                 #if step >= 5:
                 #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-                model(inputs_train, targets_train, sliding_window_num_blocks).backward()
+                model(inputs_train, targets_train, sliding_window_num_blocks, step).backward()
                 inputs_train, targets_train = train_loader.next_batch()
         if train_accumulation_steps != 1:
             for p in model.parameters():
@@ -662,8 +904,8 @@ def objective(second_growth_step, third_growth_step):
             frac = min(step / 300, 1)
             for group in optimizer4.param_groups:
                 group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-        if step == 1250:
-            args.val_loss_every = 8
+        #if step == 1250:
+        #    args.val_loss_every = 8
         # step the optimizers and schedulers
         for opt, sched in zip(optimizers, schedulers):
             opt.step()
@@ -673,24 +915,25 @@ def objective(second_growth_step, third_growth_step):
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-        # for sweep, when we let it reach the end
-        training_time_ms = approx_time
         print0(
             f"step:{step + 1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time / timed_steps:.2f}ms")
 
-    score = -training_time_ms - (best_step * 3.0) - (best_val_loss * 400.0) if best_val_loss <= target_loss else -999999
+    #score = -training_time_ms - (best_step * 3.0) - (best_val_loss * 400.0) if best_val_loss <= target_loss else -999999
+    score = -best_val_loss
     print(f"\n\n!!!!!!\nSCORE:{score}\n!!!!!!\n\n")
     if score > best_score:
         best_score = score
-        update_best_params(args.second_growth_step, args.third_growth_step, best_step, best_val_loss, training_time_ms, score)
+    update_best_params(args.token_loss_max_weight, args.stats_update_interval, args.recent_token_memory, best_score == score, best_step, best_val_loss, training_time_ms, score)
     return score
 
 
-def update_best_params(second_growth_step, third_growth_step, step, val_loss, training_time_ms, score):
+def update_best_params(token_loss_max_weight, stats_update_interval, recent_token_memory, is_best, step, val_loss, training_time_ms, score):
     with open('best_params.json', 'a') as f:
         json.dump({
-            'second_growth_step': second_growth_step,
-            'third_growth_step': third_growth_step,
+            'token_loss_max_weight': token_loss_max_weight,
+            'stats_update_interval': stats_update_interval,
+            'recent_token_memory': recent_token_memory,
+            'is_best': is_best,
             'step': step,
             'val_loss': val_loss,
             'training_time_ms': training_time_ms,
@@ -700,8 +943,10 @@ def update_best_params(second_growth_step, third_growth_step, step, val_loss, tr
 
 # Bayesian Optimization
 pbounds = {
-    'second_growth_step': (450, 650),
-    'third_growth_step': (850, 1120)
+    'token_loss_max_weight': (1.018, 1.025), #(1.0, 1.1),
+    # These are *100 (they're divided before rounding)
+    'stats_update_interval': (19_00, 19_00.1), #(1_00, 50_00)
+    'recent_token_memory': (9_00, 9_00.1), #(1_00, 10_00),
 }
 
 optimizer = BayesianOptimization(
@@ -710,10 +955,11 @@ optimizer = BayesianOptimization(
     random_state=42,
 )
 # Dry run for timing (big ouch but necessary)
-objective(args.second_growth_step, args.third_growth_step)
+objective(args.token_loss_max_weight, args.stats_update_interval * 100, args.recent_token_memory * 100)
+
 best_score = -float("inf")
 optimizer.maximize(
-    init_points=5,
+    init_points=7,
     n_iter=35,
 )
 
